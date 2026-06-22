@@ -27,8 +27,7 @@ help:
 
 test:
 	$(EMACS) -Q --batch $(LOADPATH) \
-	  -l nelisp-cfront \
-	  -l test/nelisp-cfront-test.el \
+	  --eval '(dolist (f (directory-files "test" t "-test\\.el$$")) (load f))' \
 	  -f ert-run-tests-batch-and-exit
 
 compile:

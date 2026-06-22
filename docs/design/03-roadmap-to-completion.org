@@ -1,0 +1,57 @@
+#+TITLE: Doc 03 — Roadmap to "completion" of nelisp-cfront
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-22
+#+STATUS: LIVE — milestone tracker
+
+* §0 What "completion" means (honest scope)
+
+"Complete nelisp-cfront" has two defensible targets, ~10-50x apart in
+effort:
+
+- *MVP-complete* (=v0.1=): a real C front-end that compiles a *useful C
+  subset* (functions, int/long/char/pointer/struct/array, arithmetic,
+  control flow, locals, calls, a small libc) end-to-end to native,
+  driven from a =.c= file.  Genuinely usable; achievable in a bounded
+  number of milestones.
+- *SQLite-complete* (=v1.0=): compiles the SQLite amalgamation and
+  replaces the rusqlite FFI in =nelisp-sqlite= with a pure-grammar build.
+  The original 脱ライブラリ goal.  A multi-month long-pole behind the
+  hard-tail C features (varargs / function pointers / setjmp).
+
+Plan: drive to MVP-complete first (M2+M3), then take the hard tail
+(M4) toward SQLite (M5).  Each milestone has a runnable "definition of
+done" so progress is verifiable, not asserted.
+
+* §1 Milestones (mirrors the task list)
+
+| # | milestone | definition of done | status |
+|---+-----------+--------------------+--------|
+| M1 | substrate + gating item | Stages 0-4 PASS; locals/loops native, runtime-free | *DONE* (Docs 01-02) |
+| M2.1 | C lexer | tokenizes the subset; ERT green | *DONE* (src/nelisp-cfront-lex.el) |
+| M2.2 | C parser → AST | recursive-descent for the subset; ERT on AST shape | next |
+| M2.3 | typecheck + layout | struct offsets/sizes/align, int widths, array index | |
+| M2.4 | lowering AST → grammar | Doc 02 scheme; emits compilable grammar | |
+| M2.5 | CLI driver | =make cc FILE=foo.c= → .o; link+run a real C program | *= MVP-complete* |
+| M3 | libc-in-grammar | memcpy/memset/str*/malloc-free(slab); non-trivial C runs | |
+| M4 | hard-tail C | varargs, fn-ptrs, goto, struct-by-value, unions/bitfields; +u16/u32 ops, no-param init helper | |
+| M5 | SQLite | amalgamation compiles; nelisp-sqlite uses it | *= v1.0 / 脱ライブラリ* |
+
+* §2 Grammar polish backlog (small, from Doc 01/02)
+
+- native =ptr-read/write-u16/u32= ops (currently composed from u8; perf).
+- no-param non-foldable-init helper for frame-slot locals (Doc 02 §3):
+  pick one of =(opaque K)= grammar op / hidden synthetic param / module
+  global seed.
+- object-mode rodata/string path (v1 forbids strings in bodies; needed
+  for C string literals beyond driver-supplied buffers).
+
+* §3 Operating rules
+
+- Every milestone ships with a runnable check (ERT and/or a =make=
+  target) — keep =make test= + the stage targets green.
+- Verify each grammar op against nelisp source before relying on it
+  (drift rule).  Reuse nelisp (=nelisp-aot-compile-to-object=, allocator,
+  syscalls); never fork it.
+- Record progress via =anvil-worklog=; design changes as numbered docs.
+- Honest status only: "runs" means a native binary produced the asserted
+  output, not "should work".
