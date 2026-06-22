@@ -186,34 +186,115 @@ Carried forward: pointers/structs use params not =let= (env-backed);
 alignment not stress-tested (malloc/16-aligned only); pointer-to-pointer
 and struct-by-value not yet exercised.
 
-** Stage 3 — one syscall / file I/O (~1.5 d)
+** Stage 3 — one syscall / file I/O (DONE — VERIFIED 2026-06-22)
 
-#+begin_src c
-  write(1, "hi\n", 3);                   /* then openat→read→close one file */
-#+end_src
+Thin =syscall-direct= wrappers (write/read/openat/close); the C driver
+orchestrates.  Buffers + path come from the driver (the v1 object mode
+forbids string literals in grammar bodies).
 
 #+begin_src emacs-lisp
-  (defun emit_hi (bufptr) (syscall-direct 1 1 bufptr 3 0 0 0))  ; write(1, buf, 3)
+  (defun nelisp_cfront_stage3_write (fd buf n) (syscall-direct 1 fd buf n 0 0 0))
+  (defun nelisp_cfront_stage3_read  (fd buf n) (syscall-direct 0 fd buf n 0 0 0))
+  ;; openat(AT_FDCWD=-100, path, O_WRONLY|O_CREAT|O_TRUNC=577, 0644=420)
+  (defun nelisp_cfront_stage3_openat_wr (path) (syscall-direct 257 -100 path 577 420 0 0))
+  (defun nelisp_cfront_stage3_openat_rd (path) (syscall-direct 257 -100 path 0 0 0 0))
+  (defun nelisp_cfront_stage3_close (fd) (syscall-direct 3 fd 0 0 0 0 0))
 #+end_src
 
-Proves: the libc/VFS boundary with no Rust.  Table has write=1, openat=257,
-read=0, close=3, lseek=8.  Wall candidates: errno, buffered stdio,
-string↔C-buffer marshaling.
+RESULT: =make stage3= PASS (runtime-free object).  =write(1,"hi\n",3)=
+prints =hi=; the file round-trip openat→write→close / openat→read→close
+created =/tmp/nelisp_cfront_stage3.txt= and read its bytes back equal to
+what was written.  *The libc/VFS bottom works with zero Rust.*
 
-* §4 Decision-gate output (the cost curve)
+*** Constraint observed (same family as the Stage 1 wall)
 
-After Stage 3, emit a *grammar-coverage report* classifying each C
-construct seen as:
+Orchestrating multiple syscalls *inside one grammar function* needs to
+hold an fd in a local across calls — which is the env-backed-=let= /
+no-=TCO= wall.  So the spike orchestrates from the driver and keeps each
+wrapper a single inline syscall.  A real front-end must own local
+liveness (SSA / explicit stack frame), not lean on grammar =let=.
 
-1. 1:1 — maps to an existing grammar op,
-2. composed — built from existing ops,
-3. needs a new grammar op (cost: extend =nelisp-cc=),
-4. needs a libc implementation (cost: write it in the grammar).
+Deferred libc concerns (not blockers, just unimplemented): =errno=
+convention is "negative return = -errno" (no global, no =perror=);
+buffered stdio; =string=↔C-buffer marshaling (here the driver supplies
+buffers).
 
-Then enumerate the libc surface a real target (e.g. SQLite) needs —
-=malloc/memcpy/str*/printf-family/qsort/vfs file-lock= — and assign each
-to 1–4.  That report decides whether to build the C99 front-end +
-libc-in-grammar.
+* §4 Decision-gate output — cost curve (FILLED, post Stage 0-3)
+
+All four spike stages PASS, each producing a *runtime-free* object
+(=nm=: no =U= externs) that links with a bare C driver and runs native.
+The central unknown — *does C semantics fit the native grammar?* — is
+answered *YES for the systems core*.  Cost is now characterised.
+
+** §4.1 C construct → grammar coverage (measured)
+
+| C construct | class | how | stage |
+|-------------+-------+-----+-------|
+| functions, params, return (System V ABI) | ① 1:1 | defun; i64 in rdi/rsi…, ret rax | 0 |
+| =+ - *=, =& \vert ^=, =<< >>= | ① 1:1 | =+ - *=, =logand logior logxor=, =shl shr= | 1,2 |
+| =< <= = > >=…=, =if= / =?:= / =&&= | ① 1:1 | =< <= ==, =if=, =cond=, =and= | 1 |
+| pointer deref / =p[i]= / =s->f= (u8,u64) | ① 1:1 | =ptr-read/write-u8/u64= (real native mem) | 2 |
+| =malloc/free= | ① 1:1* | =nl_mmap_alloc/dealloc= (mmap; *page-grained) | 2 |
+| OS / syscalls | ① 1:1 | =syscall-direct= (any Linux syscall) | 3 |
+| narrow int assign (u8) | ② composed | =logand= mask | 1 |
+| =u16/u32= load/store | ② composed | u8 reads + =shl= + =logior= | 2 |
+| loops (small) | ② composed | param-threaded recursion | 1 |
+
+** §4.2 Walls found (cost to clear)
+
+1. *=let=/=setq= are env-backed* — they emit =nl_alloc_symbol= /
+   =nelisp_env_set_value=, needing the nelisp runtime.  C locals must be
+   lowered as *SSA / param-threaded* (or to a future register-local op),
+   NOT to grammar =let=.  [Stage 1]  — *the #1 design decision; walls 2
+   and 4 are the same root.*
+2. *No TCO* — recursion depth = iteration count; big loops overflow the
+   native stack.  Needs a *register-local loop op* (new grammar op) or
+   front-end SSA-with-backedge.  [Stage 1]
+3. *No single =u16/u32= memory op* — composable from u8 but a native
+   =ptr-read/write-u16/u32= would cut size/cost (SQLite is u32-heavy).
+   [Stage 2]
+4. *Multi-statement orchestration needs locals across calls* — same root
+   as #1.  Front-end owns local liveness.  [Stage 3]
+5. *v1 object mode: no strings / rodata* — string literals can't be
+   embedded; data comes from the caller until a rodata path lands.  [0,3]
+
+** §4.3 libc surface a real target (SQLite) needs → class
+
+| libc need | class | note |
+|-----------+-------+------|
+| =memcpy/memset/memmove= | ④ write in grammar | trivial over =ptr-*= |
+| =malloc/free/realloc= | ④ (have mmap base) | need slab + realloc on =nl_mmap_*= |
+| =str*= (=strlen/strcmp/…=) | ④ write in grammar | straightforward over =ptr-read-u8= |
+| =printf=-family | ④ + ③ varargs | *hard tail* — varargs unproven |
+| =qsort=, =bsearch= | ④ (needs fn ptrs) | depends on function pointers |
+| file VFS (=fcntl= locks, =lseek=, =pread=) | ① syscalls | =syscall-direct= covers it; policy in grammar |
+| =errno=/=perror= | ④ convention | negative-return = -errno; no global yet |
+
+** §4.4 Hard-tail C (Vacietis-class; SQLite uses these)
+
+=goto=, struct-by-value args/returns, *varargs* (printf — heavy),
+*function pointers* (VDBE dispatch — heavy), unions/bitfields, =setjmp=.
+These are not exercised by the spike and are the genuine long-pole for
+SQLite specifically.
+
+** §4.5 Go / no-go
+
+FEASIBLE as a research capability: the native lowering target is proven
+sufficient for the systems core, end-to-end, with no Rust in the run
+path.  NOT cheap.  Cost concentrates in, in order:
+
+1. *Local-variable / loop lowering strategy* (walls 1,2,4) — must land
+   first; everything downstream depends on it.  Likely = front-end SSA +
+   one or two new grammar ops (register-local loop; u16/u32 mem).
+2. *C99 front-end* (lex/parse/typecheck/lower) — the bulk, but standard.
+3. *libc-in-grammar subset* (§4.3) — substantial but mechanical except
+   varargs.
+4. *Hard-tail C* (§4.4) — the real long-pole if/when SQLite is the target.
+
+Recommended next step if continuing: resolve item 1 (a register-local /
+SSA loop that lowers a C =for= to native WITHOUT env-backed =let=),
+since it gates the front-end design.  SQLite remains a distant target
+behind items 2-4.
 
 * §5 Honest residual risks (NOT in the spike)
 

@@ -93,7 +93,13 @@ migration.
 | 0 harness ✓ PASS | compile → link → run round-trip (native, no cargo) | (any defun) |
 | 1 int-only C ✓ PASS | recursion / if / cmp / arith / narrow-int mask (runtime-free) | if, cmp (< <=), + - *, logand |
 | 2 ptr + struct ✓ PASS | real (mmap) memory machine; u32 composed from u8 (gap) | ptr-read/write-u8/u64, nl_mmap_alloc, shl/logior |
-| 3 one syscall | libc/VFS boundary without Rust | =syscall-direct= |
+| 3 one syscall ✓ PASS | libc/VFS boundary without Rust (write + file roundtrip) | =syscall-direct= |
 
-Output = a grammar-coverage / cost-curve report that decides whether to
-build the C99 front-end + libc-in-grammar.
+Spike DONE (Stages 0-3 all PASS, runtime-free).  Verdict: FEASIBLE as a
+research capability — the native lowering target is proven sufficient for
+the systems core (memory, syscalls, arithmetic, C-ABI) with no Rust in
+the run path.  Cost is characterised in =docs/design/01= §4 (cost curve):
+the gating item is a local-variable / loop lowering strategy that does
+NOT use the env-backed grammar =let= (walls 1,2,4), then the C99
+front-end, then a libc subset, then hard-tail C (varargs / function
+pointers) for SQLite specifically.
