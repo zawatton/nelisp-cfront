@@ -5,13 +5,28 @@
 
 * Status — read this first
 
-This is an *early, exploratory research project*.  It is *not* a usable
-C compiler and may never become one.  The current goal is a *feasibility
-spike*, not a product: measure whether C semantics can be lowered onto
-the existing =nelisp-cc= AOT grammar, and where the walls are.
+Early research project, still pre-1.0.  As of 2026-06-23 it compiles a
+useful *integer-C subset* end-to-end to native code (no Rust in the run
+path); pointers/structs (M2.3), a libc subset (M3), and the hard-tail C
+features needed for real libraries like SQLite/libxml2 (M4-M6) are not
+done yet.  See =docs/design/03-roadmap-to-completion.org= for the
+milestone ladder and =docs/design/01-02= for the proven substrate.
 
-Nothing here is committed to long-term support.  Breaking changes are
-expected on most commits.
+Breaking changes are expected on most commits.
+
+* Compiling C today (integer-C MVP)
+
+#+begin_src sh
+  make cc FILE=examples/demo.c OUT=demo.o   # C -> native ET_REL .o
+  cc driver.c demo.o -o prog && ./prog       # link with cc, run
+#+end_src
+
+Each C function becomes a C-callable (System V ABI) native symbol.
+Working: functions/recursion, =int/long= locals + params, =+ - * / %=,
+=& | ^ << >> ~=, comparisons, =&& || !=, =if/else=, =while=, =for=,
+early-return guard clauses, assignment (incl. compound), calls, =?:=.
+Verified by =test/nelisp-cfront-e2e-test.el= (fib / sumto / gcd /
+bitwise compile, link, and run with correct output).
 
 * Purpose
 

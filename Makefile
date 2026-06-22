@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 help
+.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc help
 
 EMACS ?= emacs
 
@@ -71,6 +71,12 @@ stage4:
 	  -l nelisp-cfront \
 	  -l spike/stage4-harness.el \
 	  --eval '(nelisp-cfront-stage4-run)'
+
+# Compile a C file to a native .o:  make cc FILE=foo.c [OUT=foo.o] [ARCH=x86_64]
+cc:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront-cc \
+	  -f nelisp-cfront-cc-batch
 
 clean:
 	rm -f src/*.elc test/*.elc spike/*.elc
