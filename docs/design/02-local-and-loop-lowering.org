@@ -1,0 +1,104 @@
+#+TITLE: Doc 02 — Local-variable & loop lowering (the gating item)
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-22
+#+STATUS: DONE — design validated end-to-end (Stage 4 PASS)
+
+* §0 Why this gates everything
+
+Doc 01 §4 found that C locals/loops are the #1 cost item: the grammar
+=let=/=setq= are *environment-backed* (emit =nl_alloc_symbol= /
+=nelisp_env_set_value=, needing the nelisp runtime), and recursion has
+*no TCO* (large loops overflow the native stack).  Every later piece —
+the C front-end, libc-in-grammar — depends on how a C function gets
+mutable locals and loops.  This doc resolves it.
+
+* §1 Root cause (measured)
+
+=nelisp-aot-compiler.el= =parse-multi-let= (≈L1138) decides per binding:
+
+- *foldable init* (compile-time constant, e.g. literal =0=) → pushed into
+  the compile-time =env= as a constant.  NOT a mutable location.  A later
+  =setq= on it has no slot to find and falls to the env value-cell bridge
+  (=nl_alloc_symbol= / =nelisp_env_set_value=) — the Stage 1 link failure.
+- *non-foldable init* → allocates a *frame slot* =(:class gp :slot N)= in
+  =fenv= (an rbp-relative stack slot).  =setq= on it (≈L7638) emits the
+  runtime-free =setq-local= IR (a frame write).
+
+Frame slots are rbp-relative, so they *survive function calls*; and
+grammar =while= (=nelisp-cc-sf-while=) is a *native loop*, so no recursion
+is needed.
+
+Probe (=/tmp/nlcf_probe.el=, 2026-06-22):
+
+| let init | result object |
+|----------+---------------|
+| =(let ((s 0)(i 0)) … (setq s …))= | =U nelisp_env_set_value=, =U nl_alloc_symbol= (env) |
+| =(let ((s (- n n))…) … (setq s …))= | NONE — runtime-free (frame slots) |
+
+* §2 The lowering scheme
+
+A C function body lowers to one outer =let= that declares every mutable
+local as a frame slot, then a =seq= of statements; C =for/while= becomes
+grammar =while=; assignments become =setq=; locals/params read directly.
+
+#+begin_src c
+  long sum(long n){ long s=0; for(long i=0;i<n;i++) s+=i; return s; }
+#+end_src
+
+#+begin_src emacs-lisp
+  (defun sum (n)
+    (let ((s <nf0>) (i <nf0>))            ; frame slots; <nf0> = non-foldable 0
+      (seq
+       (while (< i n)
+         (seq (setq s (+ s i)) (setq i (+ i 1))))
+       s)))
+#+end_src
+
+Rules:
+1. *Mutable C local → frame-slot =let= binding with a NON-foldable init.*
+   The front-end must not let a constant init be const-folded, or the
+   slot is never created.
+2. *Statements → =seq=*; *assignment → =setq=* (slot write); *reads →
+   the bare symbol* (slot read).
+3. *Loops → grammar =while=* (native; no recursion → no stack overflow).
+   =for(init;cond;step)body= → init the slots, =(while COND (seq body
+   step))=.
+4. *Calls mid-body are safe* — slots are rbp-relative and survive calls
+   (so multi-statement code with calls works; the Doc 01 wall #4 is gone).
+
+* §3 The non-foldable-init detail
+
+To force slot allocation for a constant-initialised mutable local, emit a
+non-foldable expression equal to the constant:
+
+- function has a param =p=: =(- p p)= = 0, =(logand p 0)= = 0, etc.
+- general constant C: =(+ (- p p) C)=.
+- *no-param function*: OPEN ITEM.  Options (Doc 03 backlog): (a) a tiny
+  new grammar op =(opaque K)= the folder never folds; (b) thread a
+  synthetic hidden param; (c) seed from a module global.  Not a blocker —
+  most C functions take params, and helpers can be given one.
+
+This is the only rough edge; the mechanism itself is clean and proven.
+
+* §4 Validation — Stage 4 (PASS)
+
+=make stage4= (=spike/stage4-harness.el=), runtime-free object, native run:
+
+| probe | C | result |
+|-------+---+--------|
+| big loop | =sum(n)= with =n=1,000,000= | =499999500000= (a recursion lowering overflows ~650k; native =while= does not) |
+| slot survives call | =i= updated via =inc(i)= each iter | =sum_call(100)=4950= |
+
+=nm= shows no =U= externs → fully runtime-free.  All four walls from
+Doc 01 §4 that pointed at this item (#1 env-let, #2 no-TCO, #4 across-call
+locals) are resolved by this scheme.
+
+* §5 Consequences for the front-end
+
+- The front-end allocates a frame-slot =let= for the union of a function's
+  mutable locals, lowers C control flow to =if= / =while= / =seq=, and
+  uses =setq= for assignment — all runtime-free.
+- Remaining grammar gaps (Doc 01 §4) are now *narrow*: native =u16/u32=
+  memory ops (perf), the no-param non-foldable-init helper, and the
+  hard-tail C features (varargs / function pointers) for SQLite.
+- This unblocks Milestone M2 (the C99 front-end) in Doc 03.

@@ -94,6 +94,7 @@ migration.
 | 1 int-only C ✓ PASS | recursion / if / cmp / arith / narrow-int mask (runtime-free) | if, cmp (< <=), + - *, logand |
 | 2 ptr + struct ✓ PASS | real (mmap) memory machine; u32 composed from u8 (gap) | ptr-read/write-u8/u64, nl_mmap_alloc, shl/logior |
 | 3 one syscall ✓ PASS | libc/VFS boundary without Rust (write + file roundtrip) | =syscall-direct= |
+| 4 local/loop ✓ PASS | gating item: C locals→frame slots + native while, runtime-free | =let=-rt slot, =while=, =setq-local= |
 
 Spike DONE (Stages 0-3 all PASS, runtime-free).  Verdict: FEASIBLE as a
 research capability — the native lowering target is proven sufficient for

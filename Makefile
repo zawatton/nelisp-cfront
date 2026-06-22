@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 stage2 stage3 help
+.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 help
 
 EMACS ?= emacs
 
@@ -65,6 +65,13 @@ stage3:
 	  -l nelisp-cfront \
 	  -l spike/stage3-harness.el \
 	  --eval '(nelisp-cfront-stage3-run)'
+
+# Stage 4: native while-loop + frame-slot C locals (the gating item) -> native.
+stage4:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront \
+	  -l spike/stage4-harness.el \
+	  --eval '(nelisp-cfront-stage4-run)'
 
 clean:
 	rm -f src/*.elc test/*.elc spike/*.elc
