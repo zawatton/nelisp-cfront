@@ -48,6 +48,9 @@
   "Stack of break-flag symbols for the enclosing loops (innermost first).")
 (defvar nelisp-cfront-lower--brk-counter 0
   "Per-function counter for generating unique break-flag names.")
+(defvar nelisp-cfront-lower--ret-mode nil
+  "When non-nil, (RET-SET-SYM . RET-VAL-SYM) for single-exit return mode
+\(used for functions that `return' from inside a loop).")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
@@ -307,6 +310,33 @@ in this MVP)."
          ((or 'while 'for) nil)         ; nested loop: not ours
          (_ nil))))
 
+(defun nelisp-cfront-lower--guard-clear (flags inner)
+  "Return INNER guarded so it only runs when all FLAGS are 0."
+  (if (null flags) inner
+    `(if (= ,(car flags) 0)
+         ,(nelisp-cfront-lower--guard-clear (cdr flags) inner)
+       0)))
+
+(defun nelisp-cfront-lower--active-exit-flags ()
+  "Exit flags in scope: innermost break flag + the return flag (if any)."
+  (delq nil (list (car nelisp-cfront-lower--brk-stack)
+                  (and nelisp-cfront-lower--ret-mode
+                       (car nelisp-cfront-lower--ret-mode)))))
+
+(defun nelisp-cfront-lower--return-in-loop-p (node in-loop)
+  "Non-nil when NODE contains a `return' lexically inside a loop."
+  (and (consp node)
+       (pcase (car node)
+         ('return in-loop)
+         ('block (cl-some (lambda (s) (nelisp-cfront-lower--return-in-loop-p s in-loop))
+                          (cdr node)))
+         ('if (or (nelisp-cfront-lower--return-in-loop-p (nth 2 node) in-loop)
+                  (nelisp-cfront-lower--return-in-loop-p (nth 3 node) in-loop)))
+         ('while (nelisp-cfront-lower--return-in-loop-p (nth 2 node) t))
+         ('for (or (nelisp-cfront-lower--return-in-loop-p (nth 1 node) in-loop)
+                   (nelisp-cfront-lower--return-in-loop-p (nth 4 node) t)))
+         (_ nil))))
+
 (defun nelisp-cfront-lower--exit-stmt-p (s)
   "Non-nil when S always exits the current iteration (break/continue/return)."
   (and (consp s)
@@ -333,26 +363,32 @@ in this MVP)."
              ,(nelisp-cfront-lower--stmts-effect rest))
         (nelisp-cfront-lower--seq
          (list (nelisp-cfront-lower--effect s)
-               (nelisp-cfront-lower--stmts-effect rest))))))))
+               ;; after a stmt that may break/continue/return, run the rest
+               ;; only while no exit flag is set (no-op when none are active)
+               (nelisp-cfront-lower--guard-clear
+                (nelisp-cfront-lower--active-exit-flags)
+                (nelisp-cfront-lower--stmts-effect rest)))))))))
 
 (defun nelisp-cfront-lower--lower-loop (cnd body step)
   "Lower a loop with condition CND, BODY, optional STEP expr (for-loops).
-Adds a break-flag + guarded condition/step when the body breaks/continues."
-  (if (nelisp-cfront-lower--body-has-break body)
-      (let ((flag (nelisp-cfront-lower--gensym-brk)))
-        (push flag nelisp-cfront-lower--synth)
-        (let* ((nelisp-cfront-lower--brk-stack
-                (cons flag nelisp-cfront-lower--brk-stack))
-               (b (nelisp-cfront-lower--effect body))
-               (st (and step `(if (= ,flag 0)
-                                  ,(nelisp-cfront-lower--expr step) 0))))
-          `(while (if (= ,flag 0) ,(nelisp-cfront-lower--cond cnd) 0)
-             ,(nelisp-cfront-lower--seq
-               (if st (list b st) (list b))))))
-    `(while ,(nelisp-cfront-lower--cond cnd)
-       ,(nelisp-cfront-lower--seq
-         (cons (nelisp-cfront-lower--effect body)
-               (and step (list (nelisp-cfront-lower--expr step))))))))
+The condition and the for-step are guarded by every active exit flag (the
+loop's own break flag if the body breaks, plus the function return flag in
+single-exit mode), so break/continue/return all exit correctly."
+  (let ((flag (and (nelisp-cfront-lower--body-has-break body)
+                   (nelisp-cfront-lower--gensym-brk))))
+    (when flag (push flag nelisp-cfront-lower--synth))
+    (let* ((nelisp-cfront-lower--brk-stack
+            (if flag (cons flag nelisp-cfront-lower--brk-stack)
+              nelisp-cfront-lower--brk-stack))
+           (b (nelisp-cfront-lower--effect body))
+           (flags (delq nil (list flag (and nelisp-cfront-lower--ret-mode
+                                            (car nelisp-cfront-lower--ret-mode)))))
+           (acond (nelisp-cfront-lower--guard-clear
+                   flags (nelisp-cfront-lower--cond cnd)))
+           (st (and step (nelisp-cfront-lower--guard-clear
+                          flags (nelisp-cfront-lower--expr step)))))
+      `(while ,acond
+         ,(nelisp-cfront-lower--seq (if st (list b st) (list b)))))))
 
 (defun nelisp-cfront-lower--effect (s)
   "Lower statement S in effect (value-discarded) position."
@@ -373,7 +409,12 @@ Adds a break-flag + guarded condition/step when the body breaks/continues."
               (nelisp-cfront-lower--err :break-outside-loop s)))
     ('continue (if nelisp-cfront-lower--brk-stack 0   ; guard-lift skips the rest
                  (nelisp-cfront-lower--err :continue-outside-loop s)))
-    ('return (nelisp-cfront-lower--err :early-return-in-loop-unsupported s))
+    ('return (if nelisp-cfront-lower--ret-mode
+                 (let ((rs (car nelisp-cfront-lower--ret-mode))
+                       (rv (cdr nelisp-cfront-lower--ret-mode)))
+                   `(seq (setq ,rv ,(if (nth 1 s) (nelisp-cfront-lower--expr (nth 1 s)) 0))
+                         (setq ,rs 1)))
+               (nelisp-cfront-lower--err :early-return-in-loop-unsupported s)))
     (_ (nelisp-cfront-lower--err :unsupported-stmt s))))
 
 (defun nelisp-cfront-lower--for (s)
@@ -465,7 +506,18 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (nelisp-cfront-lower--synth nil)
          (nelisp-cfront-lower--brk-stack nil)
          (nelisp-cfront-lower--brk-counter 0)
-         (body-g (nelisp-cfront-lower--block-tail body void-p))
+         (ril (nelisp-cfront-lower--return-in-loop-p body nil))
+         (nelisp-cfront-lower--ret-mode
+          (and ril (cons 'nlcf_retset 'nlcf_retval)))
+         (body-g (if ril
+                     ;; single-exit mode: run the whole body for effect
+                     ;; (returns set the flag), then yield the return value.
+                     (progn
+                       (push 'nlcf_retset nelisp-cfront-lower--synth)
+                       (push 'nlcf_retval nelisp-cfront-lower--synth)
+                       (nelisp-cfront-lower--seq
+                        (list (nelisp-cfront-lower--effect body) 'nlcf_retval)))
+                   (nelisp-cfront-lower--block-tail body void-p)))
          (local-binds (mapcar (lambda (v)
                                 (list (nelisp-cfront-lower--lvar v)
                                       (list nelisp-cfront-lower--zero-fn)))
