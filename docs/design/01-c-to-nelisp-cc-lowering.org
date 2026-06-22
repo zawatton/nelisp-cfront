@@ -65,19 +65,33 @@ front-end will eventually call.
 Each stage: a C snippet, its hand-lowered grammar, what it proves, and
 the expected wall.
 
-** Stage 0 — harness (~0.5 d)
+** Stage 0 — harness (DONE — VERIFIED 2026-06-22)
 
 Establish compile → link → run before any C semantics.
 
 #+begin_src emacs-lisp
-  (defconst stage0--source '(defun stage0_add (a b) (+ a b)))
-  ;; nelisp-aot-compile-to-object → .o → link → call → expect 7
+  (defconst stage0--source '(defun nelisp_cfront_stage0_add (a b) (+ a b)))
+  ;; nelisp-aot-compile-to-object → stage0_add.o → cc links a C driver
+  ;; (extern long f(long,long)) → ./stage0 → add(3,4) prints 7, exit 0
 #+end_src
 
-Proves: the round-trip works.  Reuses =nelisp-cc-spike-noop= /
-=compile-elisp-objects.el=.  Implemented (skeleton) in
-=spike/stage0-harness.el=; first task is to confirm the live API + wire
-the link/run step.
+RESULT: =make stage0= PASS.  =add(3,4) = 7=, exit 0.  Round-trip proven
+end-to-end with *no cargo/Rust in the run path* — a C driver links the
+=.o= directly via =cc=.
+
+Verified facts (locked for later stages):
+- API: =(nelisp-aot-compile-to-object SEXP FILE-PATH &key (arch 'x86_64)
+  (format 'elf))= — SEXP is the FIRST arg.
+- The emitted defun is a GLOBAL =STT_FUNC= (=nm= shows
+  =T nelisp_cfront_stage0_add=), C-callable via System V AMD64 ABI
+  (i64 params in rdi/rsi, i64 return in rax) — matches =extern long
+  f(long,long)=.
+- Object is =ET_REL= x86_64 ELF; =cc= (Debian 14.2.0) links it cleanly.
+- Bodies must not contain strings (v1 object mode forbids =write= /
+  rodata) — Stage 1+ keeps that constraint until the rodata path lands.
+
+Implemented in =spike/stage0-harness.el= (=nelisp-cfront-stage0-run=);
+artifacts land in =spike/out/= (git-ignored).
 
 ** Stage 1 — int-only C (~1.5 d)
 

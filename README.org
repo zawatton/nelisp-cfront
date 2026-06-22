@@ -90,7 +90,7 @@ migration.
 
 | stage | proves | grammar exercised |
 |-------+--------+-------------------|
-| 0 harness | compile → link → run round-trip | (any defun) |
+| 0 harness ✓ PASS | compile → link → run round-trip (native, no cargo) | (any defun) |
 | 1 int-only C | arith / cmp / while / narrow-int mask | =while=, =logand=, arith |
 | 2 ptr + struct | real (mmap) memory machine | =ptr-*=, =nl_mmap_alloc= |
 | 3 one syscall | libc/VFS boundary without Rust | =syscall-direct= |

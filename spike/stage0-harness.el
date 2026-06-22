@@ -10,75 +10,94 @@
 
 ;; Stage 0 of the nelisp-cfront feasibility spike (Doc 01 §Stage 0).
 ;;
-;; Goal: prove the round-trip
+;; Proves the round-trip, with NO cargo/Rust in the run path:
 ;;
 ;;   hand-written nelisp-cc grammar source
-;;     -> nelisp-aot-compile-to-object  (nelisp)
-;;     -> ET_REL .o
-;;     -> link
-;;     -> native call returns the expected value
+;;     -> nelisp-aot-compile-to-object  (nelisp)  -> ET_REL .o
+;;     -> cc links it with a tiny C driver         -> native binary
+;;     -> running the binary returns the expected value
 ;;
 ;; This establishes that nelisp-cfront can drive the nelisp AOT toolchain
-;; before any C semantics are involved.  It is the FIRST spike task and is
-;; expected to need wiring adjustments against the live nelisp API.
+;; end-to-end before any C semantics are involved.
 ;;
-;; nelisp entry point (verify against nelisp/lisp/nelisp-aot-compiler.el):
-;;   (nelisp-aot-compile-to-object DEST SOURCE :arch ARCH :format 'elf)
-;; observed call site: nelisp/lisp/nelisp-artifact.el ~L1413.
-;;
-;; The link + native-run step reuses nelisp's existing probe runner
-;; (nelisp/scripts/compile-elisp-objects.el, which registers
-;; `:source-var <X>--source' probes).  Stage 0's job is to confirm the
-;; smallest path through it; wiring that link step is the concrete TODO.
+;; nelisp API (verified 2026-06-22, nelisp/lisp/nelisp-aot-compiler.el):
+;;   (nelisp-aot-compile-to-object SEXP FILE-PATH &key (arch 'x86_64) (format 'elf))
+;;   - SEXP is the FIRST arg; FILE-PATH the second.
+;;   - Each defun becomes a GLOBAL STT_FUNC, C-callable via System V ABI
+;;     (args in rdi/rsi/..., i64 return in rax).  Bodies must not contain
+;;     strings (the v1 object mode forbids `write' / rodata).
 
 ;;; Code:
 
 (require 'nelisp-cfront)
 
-;; The trivial grammar source under test (NOT C — a hand-written grammar
-;; defun, to isolate the toolchain round-trip from any C lowering).
+;; Captured at LOAD time: under `make stage0' the function runs via
+;; `--eval', where `load-file-name'/`buffer-file-name' are nil, so the
+;; out dir must be anchored to this file's location now, not at call time.
+(defconst nelisp-cfront-stage0--this-file
+  (or load-file-name buffer-file-name
+      (expand-file-name "spike/stage0-harness.el"))
+  "Absolute path of this harness file, captured at load time.")
+
+;; The probe source: a leaf i64 add (no allocation, no GC roots, no
+;; strings) — the simplest function that exercises params + arith.
 (defconst nelisp-cfront-stage0--source
   '(defun nelisp_cfront_stage0_add (a b) (+ a b))
   "Stage 0 probe: the simplest grammar defun the AOT path can consume.")
 
-(defun nelisp-cfront-stage0--nelisp-root ()
-  "Resolve the sibling nelisp repo root."
-  (or (getenv "NELISP_REPO_ROOT")
-      (expand-file-name "../nelisp"
-                        (file-name-directory (or load-file-name buffer-file-name default-directory)))))
+(defconst nelisp-cfront-stage0--sym "nelisp_cfront_stage0_add"
+  "C linkage name of the probe (underscores preserved by the AOT path).")
+
+(defun nelisp-cfront-stage0--dir ()
+  "Absolute path of the spike/out directory (created on demand)."
+  (let ((d (expand-file-name
+            "out"
+            (file-name-directory nelisp-cfront-stage0--this-file))))
+    (make-directory d t)
+    d))
 
 (defun nelisp-cfront-stage0-run ()
-  "Drive the Stage 0 compile-to-object probe and report status.
-Returns t on success.  Does not yet perform the link + native-run step
-\(documented TODO above\); emits the .o and reports so the next wiring
-step is unambiguous."
-  (let* ((root (nelisp-cfront-stage0--nelisp-root))
-         (outdir (expand-file-name
-                  "out"
-                  (file-name-directory (or load-file-name buffer-file-name default-directory)))))
-    (make-directory outdir t)
-    (message "[stage0] nelisp root: %s" root)
-    (message "[stage0] source: %S" nelisp-cfront-stage0--source)
+  "Run the Stage 0 compile -> link -> run round-trip.
+Returns t and messages PASS on success; signals on any failure so
+`make stage0' exits non-zero."
+  (let* ((out  (nelisp-cfront-stage0--dir))
+         (obj  (expand-file-name "stage0_add.o" out))
+         (csrc (expand-file-name "stage0_driver.c" out))
+         (bin  (expand-file-name "stage0" out)))
+    ;; 1. compile grammar source -> .o via nelisp
     (unless (require 'nelisp-aot-compiler nil t)
-      (error "[stage0] cannot load nelisp-aot-compiler from %s/lisp — set NELISP_REPO_ROOT and add it to load-path" root))
-    (unless (fboundp 'nelisp-aot-compile-to-object)
-      (error "[stage0] nelisp-aot-compile-to-object not defined after require — verify the nelisp API"))
-    (let ((dest (expand-file-name "stage0_add.o" outdir)))
-      (message "[stage0] compiling to %s ..." dest)
-      ;; NOTE: keyword args mirror the observed nelisp call site; adjust
-      ;; here if the live signature differs (first wiring task).
-      (condition-case err
-          (progn
-            (nelisp-aot-compile-to-object dest nelisp-cfront-stage0--source
-                                          :arch 'x86_64 :format 'elf)
-            (if (file-exists-p dest)
-                (progn (message "[stage0] OK: emitted %s (%d bytes). TODO: link + native run."
-                                dest (nth 7 (file-attributes dest)))
-                       t)
-              (error "[stage0] compile returned without producing %s" dest)))
-        (error
-         (message "[stage0] compile step failed: %S" err)
-         (signal (car err) (cdr err)))))))
+      (error "[stage0] cannot load nelisp-aot-compiler — set NELISP_REPO_ROOT (got %s)"
+             (or (getenv "NELISP_REPO_ROOT") "<unset>")))
+    (message "[stage0] compiling %S -> %s" nelisp-cfront-stage0--source obj)
+    (nelisp-aot-compile-to-object nelisp-cfront-stage0--source obj
+                                  :arch 'x86_64 :format 'elf)
+    (unless (file-exists-p obj)
+      (error "[stage0] AOT did not produce %s" obj))
+    ;; 2. emit a tiny C driver that calls the symbol and checks the result
+    (with-temp-file csrc
+      (insert (format "#include <stdio.h>\n")
+              (format "extern long %s(long, long);\n" nelisp-cfront-stage0--sym)
+              "int main(void){\n"
+              (format "  long r = %s(3, 4);\n" nelisp-cfront-stage0--sym)
+              "  printf(\"add(3,4) = %ld\\n\", r);\n"
+              "  return (r == 7) ? 0 : 1;\n"
+              "}\n"))
+    ;; 3. link with cc
+    (let ((cc (or (executable-find "cc") (executable-find "gcc")
+                  (error "[stage0] no cc/gcc on PATH"))))
+      (message "[stage0] linking with %s" cc)
+      (let ((rc (call-process cc nil nil nil csrc obj "-o" bin)))
+        (unless (zerop rc)
+          (error "[stage0] link failed (cc rc=%d)" rc))))
+    ;; 4. run the native binary; capture stdout + exit code
+    (with-temp-buffer
+      (let ((rc (call-process bin nil t nil)))
+        (let ((out-str (string-trim (buffer-string))))
+          (message "[stage0] %s" out-str)
+          (unless (zerop rc)
+            (error "[stage0] FAIL: native run returned %d (expected add(3,4)=7)" rc))
+          (message "[stage0] PASS — round-trip C-callable native code returned 7")
+          t)))))
 
 (provide 'stage0-harness)
 

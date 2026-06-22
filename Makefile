@@ -36,9 +36,9 @@ compile:
 	  --eval '(setq byte-compile-error-on-warn nil)' \
 	  -f batch-byte-compile src/nelisp-cfront.el
 
-# Stage 0 feasibility probe: hand-lowered grammar source -> .o -> run.
-# This target is expected to FAIL until the harness wiring is verified
-# against the running nelisp AOT toolchain — it is the first spike task.
+# Stage 0 feasibility probe: grammar source -> .o (nelisp AOT) -> cc-linked
+# native binary -> run -> assert. VERIFIED PASS 2026-06-22 (no cargo in the
+# run path). Requires NELISP_REPO_ROOT to point at a working nelisp checkout.
 stage0:
 	$(EMACS) -Q --batch $(LOADPATH) \
 	  -l nelisp-cfront \
