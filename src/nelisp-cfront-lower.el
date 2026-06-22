@@ -42,6 +42,12 @@
   "Function return-type table (name->type) for the program.")
 (defvar nelisp-cfront-lower--tenv nil
   "Type environment (var-name->type) for the current function.")
+(defvar nelisp-cfront-lower--synth nil
+  "Synthetic frame-slot locals created during lowering (e.g. break flags).")
+(defvar nelisp-cfront-lower--brk-stack nil
+  "Stack of break-flag symbols for the enclosing loops (innermost first).")
+(defvar nelisp-cfront-lower--brk-counter 0
+  "Per-function counter for generating unique break-flag names.")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
@@ -285,6 +291,69 @@ in this MVP)."
 
 ;;; --- statements ------------------------------------------------------
 
+(defun nelisp-cfront-lower--gensym-brk ()
+  (prog1 (intern (format "nlcf_brk%d" nelisp-cfront-lower--brk-counter))
+    (setq nelisp-cfront-lower--brk-counter (1+ nelisp-cfront-lower--brk-counter))))
+
+(defun nelisp-cfront-lower--body-has-break (s)
+  "Non-nil when S contains a `break'/`continue' for THIS loop level
+\(does not descend into nested while/for, which capture their own)."
+  (and (consp s)
+       (pcase (car s)
+         ((or 'break 'continue) t)
+         ('block (cl-some #'nelisp-cfront-lower--body-has-break (cdr s)))
+         ('if (or (nelisp-cfront-lower--body-has-break (nth 2 s))
+                  (nelisp-cfront-lower--body-has-break (nth 3 s))))
+         ((or 'while 'for) nil)         ; nested loop: not ours
+         (_ nil))))
+
+(defun nelisp-cfront-lower--exit-stmt-p (s)
+  "Non-nil when S always exits the current iteration (break/continue/return)."
+  (and (consp s)
+       (pcase (car s)
+         ((or 'break 'continue 'return) t)
+         ('block (let ((ss (cdr s))) (and ss (nelisp-cfront-lower--exit-stmt-p (car (last ss))))))
+         ('if (and (nth 3 s)
+                   (nelisp-cfront-lower--exit-stmt-p (nth 2 s))
+                   (nelisp-cfront-lower--exit-stmt-p (nth 3 s))))
+         (_ nil))))
+
+(defun nelisp-cfront-lower--stmts-effect (stmts)
+  "Lower STMTS in effect position, guard-lifting break/continue/return
+\(if (c) <exit>; REST  ==>  if (c) <exit> else REST)."
+  (cond
+   ((null stmts) 0)
+   ((null (cdr stmts)) (nelisp-cfront-lower--effect (car stmts)))
+   (t
+    (let ((s (car stmts)) (rest (cdr stmts)))
+      (if (and (eq (car s) 'if) (null (nth 3 s))
+               (nelisp-cfront-lower--exit-stmt-p (nth 2 s)))
+          `(if ,(nelisp-cfront-lower--cond (nth 1 s))
+               ,(nelisp-cfront-lower--effect (nth 2 s))
+             ,(nelisp-cfront-lower--stmts-effect rest))
+        (nelisp-cfront-lower--seq
+         (list (nelisp-cfront-lower--effect s)
+               (nelisp-cfront-lower--stmts-effect rest))))))))
+
+(defun nelisp-cfront-lower--lower-loop (cnd body step)
+  "Lower a loop with condition CND, BODY, optional STEP expr (for-loops).
+Adds a break-flag + guarded condition/step when the body breaks/continues."
+  (if (nelisp-cfront-lower--body-has-break body)
+      (let ((flag (nelisp-cfront-lower--gensym-brk)))
+        (push flag nelisp-cfront-lower--synth)
+        (let* ((nelisp-cfront-lower--brk-stack
+                (cons flag nelisp-cfront-lower--brk-stack))
+               (b (nelisp-cfront-lower--effect body))
+               (st (and step `(if (= ,flag 0)
+                                  ,(nelisp-cfront-lower--expr step) 0))))
+          `(while (if (= ,flag 0) ,(nelisp-cfront-lower--cond cnd) 0)
+             ,(nelisp-cfront-lower--seq
+               (if st (list b st) (list b))))))
+    `(while ,(nelisp-cfront-lower--cond cnd)
+       ,(nelisp-cfront-lower--seq
+         (cons (nelisp-cfront-lower--effect body)
+               (and step (list (nelisp-cfront-lower--expr step))))))))
+
 (defun nelisp-cfront-lower--effect (s)
   "Lower statement S in effect (value-discarded) position."
   (pcase (car s)
@@ -293,27 +362,25 @@ in this MVP)."
                       ,(nelisp-cfront-lower--expr (nth 3 s)))
              0))                              ; uninitialised: slot already 0
     ('expr-stmt (nelisp-cfront-lower--expr (nth 1 s)))
-    ('block (nelisp-cfront-lower--seq (mapcar #'nelisp-cfront-lower--effect (cdr s))))
+    ('block (nelisp-cfront-lower--stmts-effect (cdr s)))
     ('if `(if ,(nelisp-cfront-lower--cond (nth 1 s))
               ,(nelisp-cfront-lower--effect (nth 2 s))
             ,(if (nth 3 s) (nelisp-cfront-lower--effect (nth 3 s)) 0)))
-    ('while `(while ,(nelisp-cfront-lower--cond (nth 1 s))
-               ,(nelisp-cfront-lower--effect (nth 2 s))))
+    ('while (nelisp-cfront-lower--lower-loop (nth 1 s) (nth 2 s) nil))
     ('for (nelisp-cfront-lower--for s))
-    ('return (nelisp-cfront-lower--err :early-return-unsupported s))
-    ('break (nelisp-cfront-lower--err :break-unsupported s))
-    ('continue (nelisp-cfront-lower--err :continue-unsupported s))
+    ('break (if nelisp-cfront-lower--brk-stack
+                `(setq ,(car nelisp-cfront-lower--brk-stack) 1)
+              (nelisp-cfront-lower--err :break-outside-loop s)))
+    ('continue (if nelisp-cfront-lower--brk-stack 0   ; guard-lift skips the rest
+                 (nelisp-cfront-lower--err :continue-outside-loop s)))
+    ('return (nelisp-cfront-lower--err :early-return-in-loop-unsupported s))
     (_ (nelisp-cfront-lower--err :unsupported-stmt s))))
 
 (defun nelisp-cfront-lower--for (s)
   (let ((init (nth 1 s)) (cnd (nth 2 s)) (step (nth 3 s)) (body (nth 4 s)))
-    (let ((wbody (nelisp-cfront-lower--seq
-                  (append (list (nelisp-cfront-lower--effect body))
-                          (when step (list (nelisp-cfront-lower--expr step))))))
-          (wcond (if cnd (nelisp-cfront-lower--cond cnd) 1)))
-      (nelisp-cfront-lower--seq
-       (append (when init (list (nelisp-cfront-lower--effect init)))
-               (list `(while ,wcond ,wbody)))))))
+    (nelisp-cfront-lower--seq
+     (append (when init (list (nelisp-cfront-lower--effect init)))
+             (list (nelisp-cfront-lower--lower-loop (or cnd '(int 1)) body step))))))
 
 (defun nelisp-cfront-lower--tail (s void-p)
   "Lower statement S in tail (return-value) position."
@@ -395,14 +462,18 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
           (append (delq nil (mapcar (lambda (p) (and (nth 2 p) (cons (nth 2 p) (nth 1 p))))
                                     params))
                   (nelisp-cfront-lower--collect-decl-types body nil)))
+         (nelisp-cfront-lower--synth nil)
+         (nelisp-cfront-lower--brk-stack nil)
+         (nelisp-cfront-lower--brk-counter 0)
          (body-g (nelisp-cfront-lower--block-tail body void-p))
-         (wrapped (if locals
-                      `(let ,(mapcar (lambda (v)
-                                       (list (nelisp-cfront-lower--lvar v)
-                                             (list nelisp-cfront-lower--zero-fn)))
-                                     locals)
-                         ,body-g)
-                    body-g)))
+         (local-binds (mapcar (lambda (v)
+                                (list (nelisp-cfront-lower--lvar v)
+                                      (list nelisp-cfront-lower--zero-fn)))
+                              locals))
+         (synth-binds (mapcar (lambda (v) (list v (list nelisp-cfront-lower--zero-fn)))
+                              (reverse nelisp-cfront-lower--synth)))
+         (binds (append local-binds synth-binds))
+         (wrapped (if binds `(let ,binds ,body-g) body-g)))
     `(defun ,name ,pnames ,wrapped)))
 
 (defun nelisp-cfront-lower-program (ast)
