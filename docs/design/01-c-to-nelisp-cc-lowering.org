@@ -93,23 +93,52 @@ Verified facts (locked for later stages):
 Implemented in =spike/stage0-harness.el= (=nelisp-cfront-stage0-run=);
 artifacts land in =spike/out/= (git-ignored).
 
-** Stage 1 — int-only C (~1.5 d)
+** Stage 1 — int-only C (DONE — VERIFIED 2026-06-22)
 
 #+begin_src c
-  int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
-  uint8_t narrow(int x){ return x; }
+  long sum(long n){ long s=0; for(long i=0;i<n;i++) s+=i; return s; }
+  long narrow(long x){ return (uint8_t)x; }
+  long fact(long n){ return n<=1 ? 1 : n*fact(n-1); }
 #+end_src
+
+RESULT: =make stage1= PASS.  =sum(10)=45 narrow(300)=44 fact(5)=120=.
+The object is *runtime-free* — =nm= shows only =T= symbols, no =U=
+undefined externs; it links with a bare C driver, no nelisp runtime.
+
+*** WALL FOUND: grammar =let=/=setq= are environment-backed
+
+The first hand-lowering used the natural iterative form:
 
 #+begin_src emacs-lisp
-  (defun sum (n)
-    (let ((s 0) (i 0))
-      (while (< i n) (setq s (+ s i)) (setq i (+ i 1)))   ; exact mutation form: confirm in Stage 1
-      s))
-  (defun narrow (x) (logand x 255))
+  (let ((s 0) (i 0))
+    (while (< i n) (seq (setq s (+ s i)) (setq i (+ i 1)))) s)
 #+end_src
 
-Proves: arith / cmp / while / locals / narrow-int mask.
-Wall candidates: signed↔unsigned division, integer-promotion rules.
+It *compiled* but *failed to link*: undefined references to
+=nl_alloc_symbol= and =nelisp_env_set_value=.  So grammar =let=/=setq=
+do NOT lower to raw machine locals — they bind into the nelisp *runtime
+environment* (symbol alloc + env set).  Consequences for C lowering:
+
+- C locals must NOT be lowered to grammar =let=/=setq= if a runtime-free
+  object is wanted.  Lower them as *function parameters threaded through
+  recursion* (params are raw i64 registers — proven by stage0 and the
+  Stage 1 recursion form), i.e. an SSA / param-passing style in the
+  front-end.
+- =nelisp-cc= has *no TCO* (confirmed in =nelisp-cc-sf-while.el=
+  commentary): recursion depth = iteration count, so large loops
+  overflow the native stack (~650k frames in nelisp's own measurement).
+  A real C front-end must either (a) compile loops to a host =while=
+  form (which currently drags in the env runtime), or (b) emit a native
+  loop without env-backed mutation — a candidate *new grammar op*
+  (register-local loop), or (c) accept linking the nelisp runtime for
+  functions that use env locals.
+
+Confirmed runtime-free grammar ops (link with no externs): =if=, =<=,
+=<==, =+=, =-=, =*=, =logand=, self-recursion, multi/forward-ref defuns
+via =(seq ...)=.
+
+Remaining Stage 1 wall candidates (not yet exercised): signed↔unsigned
+division/shift semantics, integer-promotion rules, =u16/u32= widths.
 
 ** Stage 2 — pointer + memory + struct (~2 d)
 
