@@ -97,19 +97,16 @@ WIDTH is 1 or 8.  See `nelisp-cfront-lower-load' for the width gap."
       (error "nelisp-cfront: syscall takes at most 6 args, got %d" (length args)))
     `(syscall-direct ,nr ,@(seq-take a 6))))
 
-;;; --- Front-end entry points (DEFERRED stubs) -------------------------
-
-(defun nelisp-cfront-parse (_c-source)
-  "Parse C-SOURCE into a typed C-AST.
-DEFERRED: the C99 front-end is not part of the spike.  Hand-lower C to
-grammar sexps for now (see spike/ and Doc 01)."
-  (error "nelisp-cfront-parse: C front-end deferred — hand-lower for the spike (Doc 01)"))
-
-(defun nelisp-cfront-lower (_c-ast)
-  "Lower a typed C-AST into a nelisp-cc grammar form.
-DEFERRED until the front-end exists; the `nelisp-cfront-lower-*' helpers
-above are the per-construct building blocks it will use."
-  (error "nelisp-cfront-lower: AST lowering deferred — use the lower-* helpers directly (Doc 01)"))
+;;; --- Front-end modules -----------------------------------------------
+;;
+;; The C front-end lives in dedicated modules, loaded on demand by the
+;; driver (M2.5):
+;;   - `nelisp-cfront-lex'   (M2.1) — tokenizer
+;;   - `nelisp-cfront-parse' (M2.2) — recursive-descent parser → AST
+;;   - lowering (M2.4) consumes the AST and emits grammar via the
+;;     `nelisp-cfront-lower-*' helpers above.
+;; They are intentionally NOT required here so this file stays a small,
+;; dependency-light home for the lowering helpers.
 
 (provide 'nelisp-cfront)
 

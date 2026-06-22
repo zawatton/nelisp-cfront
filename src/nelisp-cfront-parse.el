@@ -1,0 +1,382 @@
+;;; nelisp-cfront-parse.el --- C parser (recursive descent) -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 zawatton
+
+;; Author: zawatton <kurozawawo@gmail.com>
+
+;; This file is not part of GNU Emacs.
+
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+
+;; M2.2 — recursive-descent parser for the C subset.  Consumes the M2.1
+;; lexer's token list and produces an AST.
+;;
+;; AST node shapes (tagged lists):
+;;   program    (program TOPLEVEL...)
+;;   func       (func RET-TYPE NAME (PARAM...) BODY)   ; BODY = block
+;;   global     (global TYPE NAME INIT|nil)
+;;   param      (param TYPE NAME)
+;;   type       plist (:base SYM :ptr N [:unsigned t] [:struct NAME])
+;;              BASE in (void char short int long)
+;;   stmts      (block STMT...) (if C THEN ELSE) (while C BODY)
+;;              (for INIT COND STEP BODY) (return EXPR|nil)
+;;              (decl TYPE NAME INIT|nil) (expr-stmt E) (break) (continue)
+;;   exprs      (int N) (str S) (var NAME) (call FN (ARG...))
+;;              (binop OP L R) (unop OP E) (assign OP LHS RHS)
+;;              (index A I) (member O F) (arrow O F)
+;;              (post OP E) (pre OP E) (ternary C A B)
+;;
+;; Scope: typedef/enum/switch/do-while and full declarator grammar are
+;; deferred (Doc 03 backlog).  This covers what the MVP subset needs.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'nelisp-cfront-lex)
+
+(define-error 'nelisp-cfront-parse-error "nelisp-cfront parser error")
+
+(defvar nelisp-cfront-parse--toks nil
+  "Remaining token list during a parse (dynamically bound).")
+
+(defconst nelisp-cfront-parse--type-keywords
+  '("void" "char" "short" "int" "long" "unsigned" "signed" "const"
+    "struct" "static" "extern")
+  "Keywords that may begin / appear in a type-specifier sequence.")
+
+;;; --- cursor ----------------------------------------------------------
+
+(defsubst nelisp-cfront-parse--peek () (car nelisp-cfront-parse--toks))
+(defsubst nelisp-cfront-parse--ptype () (nth 0 (car nelisp-cfront-parse--toks)))
+(defsubst nelisp-cfront-parse--pval () (nth 1 (car nelisp-cfront-parse--toks)))
+
+(defun nelisp-cfront-parse--advance ()
+  (prog1 (car nelisp-cfront-parse--toks)
+    (setq nelisp-cfront-parse--toks (cdr nelisp-cfront-parse--toks))))
+
+(defun nelisp-cfront-parse--at (type &optional val)
+  (let ((tk (nelisp-cfront-parse--peek)))
+    (and tk (eq (nth 0 tk) type)
+         (or (null val) (equal (nth 1 tk) val)))))
+
+(defun nelisp-cfront-parse--at-punct (p) (nelisp-cfront-parse--at 'punct p))
+(defun nelisp-cfront-parse--at-kw (k) (nelisp-cfront-parse--at 'keyword k))
+
+(defun nelisp-cfront-parse--eat-punct (p)
+  (if (nelisp-cfront-parse--at-punct p)
+      (nelisp-cfront-parse--advance)
+    (signal 'nelisp-cfront-parse-error
+            (list :expected-punct p :got (nelisp-cfront-parse--peek)))))
+
+(defun nelisp-cfront-parse--eat-ident ()
+  (if (nelisp-cfront-parse--at 'ident)
+      (nth 1 (nelisp-cfront-parse--advance))
+    (signal 'nelisp-cfront-parse-error
+            (list :expected-ident :got (nelisp-cfront-parse--peek)))))
+
+;;; --- types -----------------------------------------------------------
+
+(defun nelisp-cfront-parse--type-start-p ()
+  (and (nelisp-cfront-parse--at 'keyword)
+       (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords)))
+
+(defun nelisp-cfront-parse--parse-type ()
+  "Parse a type-specifier sequence + pointer stars into a type plist."
+  (let ((specs nil) (struct-name nil) (unsigned nil))
+    (while (nelisp-cfront-parse--type-start-p)
+      (let ((w (nth 1 (nelisp-cfront-parse--advance))))
+        (cond
+         ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
+         ((string= w "unsigned") (setq unsigned t))
+         ((string= w "signed") nil)
+         ((string= w "struct") (setq struct-name (nelisp-cfront-parse--eat-ident)))
+         (t (push w specs)))))
+    (let* ((specs (nreverse specs))
+           (base (cond
+                  (struct-name 'struct)
+                  ((member "long" specs) 'long)
+                  ((member "short" specs) 'short)
+                  ((member "char" specs) 'char)
+                  ((member "int" specs) 'int)
+                  ((member "void" specs) 'void)
+                  (unsigned 'int)              ; "unsigned" alone => unsigned int
+                  (t (signal 'nelisp-cfront-parse-error
+                             (list :not-a-type (nelisp-cfront-parse--peek))))))
+           (ptr 0))
+      (while (nelisp-cfront-parse--at-punct "*")
+        (nelisp-cfront-parse--advance)
+        (setq ptr (1+ ptr)))
+      (append (list :base base :ptr ptr)
+              (when unsigned '(:unsigned t))
+              (when struct-name (list :struct struct-name))))))
+
+;;; --- expressions (precedence climbing) -------------------------------
+
+(defconst nelisp-cfront-parse--binops
+  '(("*" . 10) ("/" . 10) ("%" . 10)
+    ("+" . 9) ("-" . 9)
+    ("<<" . 8) (">>" . 8)
+    ("<" . 7) ("<=" . 7) (">" . 7) (">=" . 7)
+    ("==" . 6) ("!=" . 6)
+    ("&" . 5) ("^" . 4) ("|" . 3)
+    ("&&" . 2) ("||" . 1))
+  "Binary operator precedence (higher binds tighter).")
+
+(defconst nelisp-cfront-parse--assign-ops
+  '("=" "+=" "-=" "*=" "/=" "%=" "&=" "|=" "^=" "<<=" ">>=")
+  "Assignment operators (right-associative, lowest precedence).")
+
+(defun nelisp-cfront-parse--parse-expr ()
+  (nelisp-cfront-parse--parse-assign))
+
+(defun nelisp-cfront-parse--parse-assign ()
+  (let ((lhs (nelisp-cfront-parse--parse-ternary)))
+    (if (and (nelisp-cfront-parse--at 'punct)
+             (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--assign-ops))
+        (let ((op (nth 1 (nelisp-cfront-parse--advance))))
+          (list 'assign op lhs (nelisp-cfront-parse--parse-assign)))
+      lhs)))
+
+(defun nelisp-cfront-parse--parse-ternary ()
+  (let ((c (nelisp-cfront-parse--parse-binary 1)))
+    (if (nelisp-cfront-parse--at-punct "?")
+        (progn
+          (nelisp-cfront-parse--advance)
+          (let ((a (nelisp-cfront-parse--parse-assign)))
+            (nelisp-cfront-parse--eat-punct ":")
+            (list 'ternary c a (nelisp-cfront-parse--parse-assign))))
+      c)))
+
+(defun nelisp-cfront-parse--parse-binary (min-prec)
+  (let ((left (nelisp-cfront-parse--parse-unary)))
+    (catch 'done
+      (while t
+        (let* ((tk (nelisp-cfront-parse--peek))
+               (op (and tk (eq (nth 0 tk) 'punct) (nth 1 tk)))
+               (prec (and op (cdr (assoc op nelisp-cfront-parse--binops)))))
+          (if (and prec (>= prec min-prec))
+              (progn
+                (nelisp-cfront-parse--advance)
+                (setq left (list 'binop op left
+                                 (nelisp-cfront-parse--parse-binary (1+ prec)))))
+            (throw 'done left)))))))
+
+(defconst nelisp-cfront-parse--unary-ops '("-" "!" "~" "*" "&" "+"))
+
+(defun nelisp-cfront-parse--parse-unary ()
+  (let ((tk (nelisp-cfront-parse--peek)))
+    (cond
+     ((and (eq (nth 0 tk) 'punct) (member (nth 1 tk) '("++" "--")))
+      (nelisp-cfront-parse--advance)
+      (list 'pre (nth 1 tk) (nelisp-cfront-parse--parse-unary)))
+     ((and (eq (nth 0 tk) 'punct) (member (nth 1 tk) nelisp-cfront-parse--unary-ops))
+      (nelisp-cfront-parse--advance)
+      (list 'unop (nth 1 tk) (nelisp-cfront-parse--parse-unary)))
+     ((and (eq (nth 0 tk) 'keyword) (string= (nth 1 tk) "sizeof"))
+      (nelisp-cfront-parse--advance)
+      ;; sizeof(type) or sizeof expr — MVP: sizeof(type) only
+      (nelisp-cfront-parse--eat-punct "(")
+      (let ((ty (nelisp-cfront-parse--parse-type)))
+        (nelisp-cfront-parse--eat-punct ")")
+        (list 'sizeof ty)))
+     (t (nelisp-cfront-parse--parse-postfix)))))
+
+(defun nelisp-cfront-parse--parse-postfix ()
+  (let ((e (nelisp-cfront-parse--parse-primary)))
+    (catch 'done
+      (while t
+        (cond
+         ((nelisp-cfront-parse--at-punct "(")
+          (nelisp-cfront-parse--advance)
+          (let ((args nil))
+            (unless (nelisp-cfront-parse--at-punct ")")
+              (push (nelisp-cfront-parse--parse-assign) args)
+              (while (nelisp-cfront-parse--at-punct ",")
+                (nelisp-cfront-parse--advance)
+                (push (nelisp-cfront-parse--parse-assign) args)))
+            (nelisp-cfront-parse--eat-punct ")")
+            (setq e (list 'call e (nreverse args)))))
+         ((nelisp-cfront-parse--at-punct "[")
+          (nelisp-cfront-parse--advance)
+          (let ((idx (nelisp-cfront-parse--parse-expr)))
+            (nelisp-cfront-parse--eat-punct "]")
+            (setq e (list 'index e idx))))
+         ((nelisp-cfront-parse--at-punct ".")
+          (nelisp-cfront-parse--advance)
+          (setq e (list 'member e (nelisp-cfront-parse--eat-ident))))
+         ((nelisp-cfront-parse--at-punct "->")
+          (nelisp-cfront-parse--advance)
+          (setq e (list 'arrow e (nelisp-cfront-parse--eat-ident))))
+         ((or (nelisp-cfront-parse--at-punct "++") (nelisp-cfront-parse--at-punct "--"))
+          (let ((op (nth 1 (nelisp-cfront-parse--advance))))
+            (setq e (list 'post op e))))
+         (t (throw 'done e)))))))
+
+(defun nelisp-cfront-parse--parse-primary ()
+  (let ((tk (nelisp-cfront-parse--peek)))
+    (pcase (nth 0 tk)
+      ('int  (nelisp-cfront-parse--advance) (list 'int (nth 1 tk)))
+      ('char (nelisp-cfront-parse--advance) (list 'int (nth 1 tk)))
+      ('string (nelisp-cfront-parse--advance) (list 'str (nth 1 tk)))
+      ('ident (nelisp-cfront-parse--advance) (list 'var (nth 1 tk)))
+      ('punct
+       (if (string= (nth 1 tk) "(")
+           (progn (nelisp-cfront-parse--advance)
+                  (let ((e (nelisp-cfront-parse--parse-expr)))
+                    (nelisp-cfront-parse--eat-punct ")")
+                    e))
+         (signal 'nelisp-cfront-parse-error (list :unexpected-token tk))))
+      (_ (signal 'nelisp-cfront-parse-error (list :unexpected-token tk))))))
+
+;;; --- statements ------------------------------------------------------
+
+(defun nelisp-cfront-parse--parse-block ()
+  (nelisp-cfront-parse--eat-punct "{")
+  (let ((stmts nil))
+    (while (not (nelisp-cfront-parse--at-punct "}"))
+      (push (nelisp-cfront-parse--parse-stmt) stmts))
+    (nelisp-cfront-parse--eat-punct "}")
+    (cons 'block (nreverse stmts))))
+
+(defun nelisp-cfront-parse--parse-stmt ()
+  (cond
+   ((nelisp-cfront-parse--at-punct "{") (nelisp-cfront-parse--parse-block))
+   ((nelisp-cfront-parse--at-kw "if")
+    (nelisp-cfront-parse--advance)
+    (nelisp-cfront-parse--eat-punct "(")
+    (let ((c (nelisp-cfront-parse--parse-expr)))
+      (nelisp-cfront-parse--eat-punct ")")
+      (let ((then (nelisp-cfront-parse--parse-stmt))
+            (else nil))
+        (when (nelisp-cfront-parse--at-kw "else")
+          (nelisp-cfront-parse--advance)
+          (setq else (nelisp-cfront-parse--parse-stmt)))
+        (list 'if c then else))))
+   ((nelisp-cfront-parse--at-kw "while")
+    (nelisp-cfront-parse--advance)
+    (nelisp-cfront-parse--eat-punct "(")
+    (let ((c (nelisp-cfront-parse--parse-expr)))
+      (nelisp-cfront-parse--eat-punct ")")
+      (list 'while c (nelisp-cfront-parse--parse-stmt))))
+   ((nelisp-cfront-parse--at-kw "for")
+    (nelisp-cfront-parse--advance)
+    (nelisp-cfront-parse--eat-punct "(")
+    (let ((init (nelisp-cfront-parse--parse-for-clause))   ; ends with ;
+          (cond- (if (nelisp-cfront-parse--at-punct ";") nil
+                   (nelisp-cfront-parse--parse-expr))))
+      (nelisp-cfront-parse--eat-punct ";")
+      (let ((step (if (nelisp-cfront-parse--at-punct ")") nil
+                    (nelisp-cfront-parse--parse-expr))))
+        (nelisp-cfront-parse--eat-punct ")")
+        (list 'for init cond- step (nelisp-cfront-parse--parse-stmt)))))
+   ((nelisp-cfront-parse--at-kw "return")
+    (nelisp-cfront-parse--advance)
+    (let ((e (if (nelisp-cfront-parse--at-punct ";") nil
+               (nelisp-cfront-parse--parse-expr))))
+      (nelisp-cfront-parse--eat-punct ";")
+      (list 'return e)))
+   ((nelisp-cfront-parse--at-kw "break")
+    (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-punct ";") (list 'break))
+   ((nelisp-cfront-parse--at-kw "continue")
+    (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-punct ";") (list 'continue))
+   ((nelisp-cfront-parse--type-start-p)
+    (prog1 (nelisp-cfront-parse--parse-decl)
+      (nelisp-cfront-parse--eat-punct ";")))
+   (t
+    (let ((e (nelisp-cfront-parse--parse-expr)))
+      (nelisp-cfront-parse--eat-punct ";")
+      (list 'expr-stmt e)))))
+
+(defun nelisp-cfront-parse--parse-for-clause ()
+  "Parse the for-init clause up to (but not consuming) the first `;'."
+  (cond
+   ((nelisp-cfront-parse--at-punct ";") (nelisp-cfront-parse--advance) nil)
+   ((nelisp-cfront-parse--type-start-p)
+    (prog1 (nelisp-cfront-parse--parse-decl) (nelisp-cfront-parse--eat-punct ";")))
+   (t (prog1 (list 'expr-stmt (nelisp-cfront-parse--parse-expr))
+        (nelisp-cfront-parse--eat-punct ";")))))
+
+(defun nelisp-cfront-parse--parse-decl ()
+  "Parse a local declaration `TYPE NAME [= INIT]' (no trailing `;')."
+  (let* ((ty (nelisp-cfront-parse--parse-type))
+         (name (nelisp-cfront-parse--eat-ident))
+         (init nil))
+    (when (nelisp-cfront-parse--at-punct "[")    ; array decl: TYPE NAME[SIZE]
+      (nelisp-cfront-parse--advance)
+      (let ((sz (nelisp-cfront-parse--parse-expr)))
+        (nelisp-cfront-parse--eat-punct "]")
+        (setq ty (append (list :base (plist-get ty :base)
+                               :ptr (plist-get ty :ptr)
+                               :array sz)
+                         (when (plist-get ty :unsigned) '(:unsigned t))
+                         (when (plist-get ty :struct) (list :struct (plist-get ty :struct)))))))
+    (when (nelisp-cfront-parse--at-punct "=")
+      (nelisp-cfront-parse--advance)
+      (setq init (nelisp-cfront-parse--parse-assign)))
+    (list 'decl ty name init)))
+
+;;; --- top level -------------------------------------------------------
+
+(defun nelisp-cfront-parse--parse-toplevel ()
+  "Parse a function definition or a global declaration."
+  (let* ((ty (nelisp-cfront-parse--parse-type))
+         (name (nelisp-cfront-parse--eat-ident)))
+    (if (nelisp-cfront-parse--at-punct "(")
+        ;; function: params then body (or `;' prototype)
+        (progn
+          (nelisp-cfront-parse--advance)
+          (let ((params (nelisp-cfront-parse--parse-params)))
+            (nelisp-cfront-parse--eat-punct ")")
+            (if (nelisp-cfront-parse--at-punct ";")
+                (progn (nelisp-cfront-parse--advance)
+                       (list 'proto ty name params))
+              (list 'func ty name params (nelisp-cfront-parse--parse-block)))))
+      ;; global variable
+      (let ((init nil))
+        (when (nelisp-cfront-parse--at-punct "=")
+          (nelisp-cfront-parse--advance)
+          (setq init (nelisp-cfront-parse--parse-assign)))
+        (nelisp-cfront-parse--eat-punct ";")
+        (list 'global ty name init)))))
+
+(defun nelisp-cfront-parse--parse-params ()
+  (let ((params nil))
+    (cond
+     ;; () or (void)
+     ((nelisp-cfront-parse--at-punct ")") nil)
+     ((and (nelisp-cfront-parse--at-kw "void")
+           (let ((next (cadr nelisp-cfront-parse--toks)))
+             (and next (eq (nth 0 next) 'punct) (string= (nth 1 next) ")"))))
+      (nelisp-cfront-parse--advance) nil)
+     (t
+      (push (nelisp-cfront-parse--parse-param) params)
+      (while (nelisp-cfront-parse--at-punct ",")
+        (nelisp-cfront-parse--advance)
+        (push (nelisp-cfront-parse--parse-param) params))))
+    (nreverse params)))
+
+(defun nelisp-cfront-parse--parse-param ()
+  (let* ((ty (nelisp-cfront-parse--parse-type))
+         (name (if (nelisp-cfront-parse--at 'ident)
+                   (nth 1 (nelisp-cfront-parse--advance))
+                 nil)))                  ; unnamed param allowed
+    (list 'param ty name)))
+
+(defun nelisp-cfront-parse (tokens-or-source)
+  "Parse TOKENS-OR-SOURCE into an AST `(program TOPLEVEL...)'.
+Accepts either a token list (from `nelisp-cfront-lex') or a C source
+string (which is lexed first)."
+  (let ((nelisp-cfront-parse--toks
+         (if (stringp tokens-or-source)
+             (nelisp-cfront-lex tokens-or-source)
+           tokens-or-source))
+        (tops nil))
+    (while (not (nelisp-cfront-parse--at 'eof))
+      (push (nelisp-cfront-parse--parse-toplevel) tops))
+    (cons 'program (nreverse tops))))
+
+(provide 'nelisp-cfront-parse)
+
+;;; nelisp-cfront-parse.el ends here

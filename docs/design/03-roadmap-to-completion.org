@@ -13,14 +13,20 @@ effort:
   control flow, locals, calls, a small libc) end-to-end to native,
   driven from a =.c= file.  Genuinely usable; achievable in a bounded
   number of milestones.
-- *SQLite-complete* (=v1.0=): compiles the SQLite amalgamation and
-  replaces the rusqlite FFI in =nelisp-sqlite= with a pure-grammar build.
-  The original 脱ライブラリ goal.  A multi-month long-pole behind the
-  hard-tail C features (varargs / function pointers / setjmp).
+- *library-complete* (=v1.0=): compiles real C libraries and drops their
+  host/Rust dependencies for pure-grammar builds.  Two targets:
+  - *SQLite* (M5) — replace the rusqlite FFI in =nelisp-sqlite= (the
+    original 脱ライブラリ goal).
+  - *libxml2* (M6) — replace nelisp-http's host =libxml-parse-html-region=
+    dependency (and its lossy regex fallback) with a pure-grammar parser.
+  Both are multi-month long-poles behind the hard-tail C features
+  (varargs / function pointers / setjmp); libxml2 adds encodings/iconv +
+  a multi-file build surface.
 
 Plan: drive to MVP-complete first (M2+M3), then take the hard tail
-(M4) toward SQLite (M5).  Each milestone has a runnable "definition of
-done" so progress is verifiable, not asserted.
+(M4), then the library targets (M5 SQLite, M6 libxml2).  Each milestone
+has a runnable "definition of done" so progress is verifiable, not
+asserted.
 
 * §1 Milestones (mirrors the task list)
 
@@ -35,6 +41,7 @@ done" so progress is verifiable, not asserted.
 | M3 | libc-in-grammar | memcpy/memset/str*/malloc-free(slab); non-trivial C runs | |
 | M4 | hard-tail C | varargs, fn-ptrs, goto, struct-by-value, unions/bitfields; +u16/u32 ops, no-param init helper | |
 | M5 | SQLite | amalgamation compiles; nelisp-sqlite uses it | *= v1.0 / 脱ライブラリ* |
+| M6 | libxml2 | compiles; nelisp-http uses it (drops host libxml + regex fallback) | *= v1.0 / 脱ライブラリ* |
 
 * §2 Grammar polish backlog (small, from Doc 01/02)
 
