@@ -140,24 +140,51 @@ via =(seq ...)=.
 Remaining Stage 1 wall candidates (not yet exercised): signed↔unsigned
 division/shift semantics, integer-promotion rules, =u16/u32= widths.
 
-** Stage 2 — pointer + memory + struct (~2 d)
+** Stage 2 — pointer + memory + struct (DONE — VERIFIED 2026-06-22)
+
+Three probes, one runtime-free object (=nm= shows no =U= externs):
 
 #+begin_src c
-  struct P { int x; long y; };          /* x@0, y@8 — front-end computes layout */
-  long rw(void){ struct P*p=malloc(16); p->x=5; p->y=99; return p->x + p->y; }
+  // A. struct field rw on a caller pointer:  rw(p){p->x=5;p->y=99;return p->x+p->y;}  -> 104
+  // B. self-allocated heap:  heap(){P*p=malloc(16);p->x=7;p->y=35;r=...;free(p);return r;} -> 42
+  // C. u32 read composed from 4 bytes (LE):  read_u32_le(buf) -> 0x12345678
 #+end_src
 
 #+begin_src emacs-lisp
-  (defun rw ()
-    (let ((p (nl_mmap_alloc 16 8)))
-      (ptr-write-u64 p 0 5)
-      (ptr-write-u64 p 8 99)
-      (+ (ptr-read-u64 p 0) (ptr-read-u64 p 8))))
+  (defun nelisp_cfront_stage2_struct_rw (p)
+    (seq (ptr-write-u64 p 0 5) (ptr-write-u64 p 8 99)
+         (+ (ptr-read-u64 p 0) (ptr-read-u64 p 8))))
+  ;; heap: pointer threaded through PARAMS (let is env-backed, Stage 1);
+  ;; reuses nelisp's grammar-level nl_mmap_alloc / nl_mmap_dealloc
+  ;; (syscall-direct mmap/munmap — splices in, stays runtime-free).
+  (defun nelisp_cfront_stage2_read_u32_le (p off)
+    (logior (ptr-read-u8 p off)
+      (logior (shl (ptr-read-u8 p (+ off 1)) 8)
+        (logior (shl (ptr-read-u8 p (+ off 2)) 16)
+                (shl (ptr-read-u8 p (+ off 3)) 24)))))
 #+end_src
 
-Proves: a real (mmap) memory machine — native memory, not emulation.
-*First real gap*: =u16/u32= native loads (compose from u8, or add a
-grammar op), alignment, pointer-to-pointer.
+RESULT: =make stage2= PASS. =struct_rw=104 heap=42 read_u32_le=0x12345678=.
+The "memory machine" is REAL native memory (not emulation), and the
+grammar-level mmap allocator composes into a downstream object with zero
+externs.
+
+Confirmed: =ptr-read/write-u8/u64= on real memory; pointers are plain
+i64 in registers (like any param); =nl_mmap_alloc/dealloc= reusable and
+runtime-free; =shl / logior / logand= available (production AOT
+nelisp-cc-jit-secure-hash).
+
+*** GAP: no single u16/u32 load/store op (only u8 / u64)
+
+A =u32= read takes 4 =ptr-read-u8= + 3 =shl= + 3 =logior= (a =u16= takes
+2+1+1).  Functionally complete and matches C's little-endian layout
+(verified against C's =*(uint32_t*)=), but a native =ptr-read/write-u16/u32=
+op would cut code size and cost — a worthwhile grammar addition for any
+real C target (SQLite is full of u32 fields).  -> cost-curve §4.
+
+Carried forward: pointers/structs use params not =let= (env-backed);
+alignment not stress-tested (malloc/16-aligned only); pointer-to-pointer
+and struct-by-value not yet exercised.
 
 ** Stage 3 — one syscall / file I/O (~1.5 d)
 

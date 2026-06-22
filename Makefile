@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 help
+.PHONY: test compile clean stage0 stage1 stage2 help
 
 EMACS ?= emacs
 
@@ -51,6 +51,13 @@ stage1:
 	  -l nelisp-cfront \
 	  -l spike/stage1-harness.el \
 	  --eval '(nelisp-cfront-stage1-run)'
+
+# Stage 2: pointer + struct + mmap heap + u16/u32 compose -> native.
+stage2:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront \
+	  -l spike/stage2-harness.el \
+	  --eval '(nelisp-cfront-stage2-run)'
 
 clean:
 	rm -f src/*.elc test/*.elc spike/*.elc

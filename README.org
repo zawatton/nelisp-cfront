@@ -92,7 +92,7 @@ migration.
 |-------+--------+-------------------|
 | 0 harness ✓ PASS | compile → link → run round-trip (native, no cargo) | (any defun) |
 | 1 int-only C ✓ PASS | recursion / if / cmp / arith / narrow-int mask (runtime-free) | if, cmp (< <=), + - *, logand |
-| 2 ptr + struct | real (mmap) memory machine | =ptr-*=, =nl_mmap_alloc= |
+| 2 ptr + struct ✓ PASS | real (mmap) memory machine; u32 composed from u8 (gap) | ptr-read/write-u8/u64, nl_mmap_alloc, shl/logior |
 | 3 one syscall | libc/VFS boundary without Rust | =syscall-direct= |
 
 Output = a grammar-coverage / cost-curve report that decides whether to
