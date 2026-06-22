@@ -84,14 +84,17 @@
 
 (defun nelisp-cfront-parse--parse-type ()
   "Parse a type-specifier sequence + pointer stars into a type plist."
-  (let ((specs nil) (struct-name nil) (unsigned nil))
+  (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil))
     (while (nelisp-cfront-parse--type-start-p)
       (let ((w (nth 1 (nelisp-cfront-parse--advance))))
         (cond
          ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
          ((string= w "unsigned") (setq unsigned t))
          ((string= w "signed") nil)
-         ((string= w "struct") (setq struct-name (nelisp-cfront-parse--eat-ident)))
+         ((string= w "struct")
+          (setq struct-name (nelisp-cfront-parse--eat-ident))
+          (when (nelisp-cfront-parse--at-punct "{")
+            (setq struct-fields (nelisp-cfront-parse--parse-struct-body))))
          (t (push w specs)))))
     (let* ((specs (nreverse specs))
            (base (cond
@@ -110,7 +113,26 @@
         (setq ptr (1+ ptr)))
       (append (list :base base :ptr ptr)
               (when unsigned '(:unsigned t))
-              (when struct-name (list :struct struct-name))))))
+              (when struct-name (list :struct struct-name))
+              (when struct-fields (list :fields struct-fields))))))
+
+(defun nelisp-cfront-parse--parse-struct-body ()
+  "Parse `{ TYPE NAME; ... }' into a list of (field TYPE NAME)."
+  (nelisp-cfront-parse--eat-punct "{")
+  (let ((fields nil))
+    (while (not (nelisp-cfront-parse--at-punct "}"))
+      (let* ((fty (nelisp-cfront-parse--parse-type))
+             (fname (nelisp-cfront-parse--eat-ident)))
+        ;; optional array field: TYPE NAME[N]
+        (when (nelisp-cfront-parse--at-punct "[")
+          (nelisp-cfront-parse--advance)
+          (let ((sz (nelisp-cfront-parse--parse-expr)))
+            (nelisp-cfront-parse--eat-punct "]")
+            (setq fty (append fty (list :array sz)))))
+        (nelisp-cfront-parse--eat-punct ";")
+        (push (list 'field fty fname) fields)))
+    (nelisp-cfront-parse--eat-punct "}")
+    (nreverse fields)))
 
 ;;; --- expressions (precedence climbing) -------------------------------
 
@@ -320,26 +342,31 @@
 ;;; --- top level -------------------------------------------------------
 
 (defun nelisp-cfront-parse--parse-toplevel ()
-  "Parse a function definition or a global declaration."
-  (let* ((ty (nelisp-cfront-parse--parse-type))
-         (name (nelisp-cfront-parse--eat-ident)))
-    (if (nelisp-cfront-parse--at-punct "(")
-        ;; function: params then body (or `;' prototype)
+  "Parse a struct definition, function definition, or global declaration."
+  (let ((ty (nelisp-cfront-parse--parse-type)))
+    (if (nelisp-cfront-parse--at-punct ";")
+        ;; bare type declaration with no declarator: `struct P { ... };'
         (progn
           (nelisp-cfront-parse--advance)
-          (let ((params (nelisp-cfront-parse--parse-params)))
-            (nelisp-cfront-parse--eat-punct ")")
-            (if (nelisp-cfront-parse--at-punct ";")
-                (progn (nelisp-cfront-parse--advance)
-                       (list 'proto ty name params))
-              (list 'func ty name params (nelisp-cfront-parse--parse-block)))))
-      ;; global variable
-      (let ((init nil))
-        (when (nelisp-cfront-parse--at-punct "=")
-          (nelisp-cfront-parse--advance)
-          (setq init (nelisp-cfront-parse--parse-assign)))
-        (nelisp-cfront-parse--eat-punct ";")
-        (list 'global ty name init)))))
+          (list 'struct-def (plist-get ty :struct) (plist-get ty :fields)))
+      (let ((name (nelisp-cfront-parse--eat-ident)))
+        (if (nelisp-cfront-parse--at-punct "(")
+            ;; function: params then body (or `;' prototype)
+            (progn
+              (nelisp-cfront-parse--advance)
+              (let ((params (nelisp-cfront-parse--parse-params)))
+                (nelisp-cfront-parse--eat-punct ")")
+                (if (nelisp-cfront-parse--at-punct ";")
+                    (progn (nelisp-cfront-parse--advance)
+                           (list 'proto ty name params))
+                  (list 'func ty name params (nelisp-cfront-parse--parse-block)))))
+          ;; global variable
+          (let ((init nil))
+            (when (nelisp-cfront-parse--at-punct "=")
+              (nelisp-cfront-parse--advance)
+              (setq init (nelisp-cfront-parse--parse-assign)))
+            (nelisp-cfront-parse--eat-punct ";")
+            (list 'global ty name init)))))))
 
 (defun nelisp-cfront-parse--parse-params ()
   (let ((params nil))

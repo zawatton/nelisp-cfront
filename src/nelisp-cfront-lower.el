@@ -32,15 +32,23 @@
 
 (require 'cl-lib)
 (require 'nelisp-cfront-parse)
+(require 'nelisp-cfront-type)
 
 (define-error 'nelisp-cfront-lower-error "nelisp-cfront lowering error")
+
+(defvar nelisp-cfront-lower--structs nil
+  "Struct table (name->layout) for the program being lowered.")
+(defvar nelisp-cfront-lower--funcs nil
+  "Function return-type table (name->type) for the program.")
+(defvar nelisp-cfront-lower--tenv nil
+  "Type environment (var-name->type) for the current function.")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
 
 (defconst nelisp-cfront-lower--binop-map
   '(("+" . +) ("-" . -) ("*" . *) ("/" . /) ("%" . mod)
-    ("&" . logand) ("|" . logior) ("^" . logxor) ("<<" . shl) (">>" . shr)
+    ("&" . logand) ("|" . logior) ("^" . logxor) ("<<" . shl) (">>" . sar)
     ("<" . <) ("<=" . <=) (">" . >) (">=" . >=) ("==" . =))
   "C binary operators that map directly to a grammar op.")
 
@@ -60,6 +68,72 @@ names stay literal — the linker needs the original C symbol.)"
   (if (stringp name) (intern (concat "nlcf_v_" name))
     (nelisp-cfront-lower--err :bad-name name)))
 
+;;; --- typed memory access (M2.3) -------------------------------------
+
+(defun nelisp-cfront-lower--type-of (e)
+  (nelisp-cfront-type-of e nelisp-cfront-lower--tenv
+                         nelisp-cfront-lower--structs
+                         nelisp-cfront-lower--funcs))
+
+(defun nelisp-cfront-lower--load-w (addr width)
+  "Load WIDTH bytes from grammar address ADDR (offset folded into ADDR)."
+  (pcase width
+    (1 `(ptr-read-u8 ,addr 0))
+    (8 `(ptr-read-u64 ,addr 0))
+    (2 `(logior (ptr-read-u8 ,addr 0) (shl (ptr-read-u8 ,addr 1) 8)))
+    (4 `(logior (ptr-read-u8 ,addr 0)
+         (logior (shl (ptr-read-u8 ,addr 1) 8)
+          (logior (shl (ptr-read-u8 ,addr 2) 16)
+                  (shl (ptr-read-u8 ,addr 3) 24)))))
+    (_ (nelisp-cfront-lower--err :unsupported-load-width width))))
+
+(defun nelisp-cfront-lower--store-w (addr width val)
+  "Store low WIDTH bytes of VAL to grammar address ADDR."
+  (pcase width
+    (1 `(ptr-write-u8 ,addr 0 ,val))
+    (8 `(ptr-write-u64 ,addr 0 ,val))
+    (2 `(seq (ptr-write-u8 ,addr 0 (logand ,val 255))
+             (ptr-write-u8 ,addr 1 (logand (sar ,val 8) 255))))
+    (4 `(seq (ptr-write-u8 ,addr 0 (logand ,val 255))
+             (ptr-write-u8 ,addr 1 (logand (sar ,val 8) 255))
+             (ptr-write-u8 ,addr 2 (logand (sar ,val 16) 255))
+             (ptr-write-u8 ,addr 3 (logand (sar ,val 24) 255))))
+    (_ (nelisp-cfront-lower--err :unsupported-store-width width))))
+
+(defun nelisp-cfront-lower--elem-size (ptr-expr)
+  "Element size of the pointee/array element of PTR-EXPR's type."
+  (nelisp-cfront-type-size
+   (nelisp-cfront-type-pointee (nelisp-cfront-lower--type-of ptr-expr))
+   nelisp-cfront-lower--structs))
+
+(defun nelisp-cfront-lower--addr (e)
+  "Grammar address of lvalue E (deref / index / arrow / member)."
+  (pcase (car e)
+    ('unop (if (string= (nth 1 e) "*")
+               (nelisp-cfront-lower--expr (nth 2 e))
+             (nelisp-cfront-lower--err :not-an-lvalue e)))
+    ('index `(+ ,(nelisp-cfront-lower--expr (nth 1 e))
+                (* ,(nelisp-cfront-lower--expr (nth 2 e))
+                   ,(nelisp-cfront-lower--elem-size (nth 1 e)))))
+    ('arrow
+     (let* ((pty (nelisp-cfront-lower--type-of (nth 1 e)))
+            (fld (nelisp-cfront-type-field (plist-get pty :struct) (nth 2 e)
+                                           nelisp-cfront-lower--structs)))
+       `(+ ,(nelisp-cfront-lower--expr (nth 1 e)) ,(plist-get fld :offset))))
+    ('member
+     (let* ((oty (nelisp-cfront-lower--type-of (nth 1 e)))
+            (fld (nelisp-cfront-type-field (plist-get oty :struct) (nth 2 e)
+                                           nelisp-cfront-lower--structs)))
+       `(+ ,(nelisp-cfront-lower--addr (nth 1 e)) ,(plist-get fld :offset))))
+    (_ (nelisp-cfront-lower--err :not-an-lvalue e))))
+
+(defun nelisp-cfront-lower--load-lvalue (e)
+  "Load the value of memory lvalue E using its type width."
+  (nelisp-cfront-lower--load-w
+   (nelisp-cfront-lower--addr e)
+   (nelisp-cfront-type-size (nelisp-cfront-lower--type-of e)
+                            nelisp-cfront-lower--structs)))
+
 ;;; --- collect mutable locals (for the outer frame-slot let) -----------
 
 (defun nelisp-cfront-lower--collect-decls (node acc)
@@ -76,6 +150,28 @@ names stay literal — the linker needs the original C symbol.)"
       (_ nil)))
   acc)
 
+(defun nelisp-cfront-lower--collect-decl-types (node acc)
+  "Collect (NAME . TYPE) for local declarations in NODE into ACC."
+  (when (consp node)
+    (pcase (car node)
+      ('decl (push (cons (nth 2 node) (nth 1 node)) acc))
+      ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types s acc))))
+      ('if (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc))
+           (setq acc (nelisp-cfront-lower--collect-decl-types (nth 3 node) acc)))
+      ('while (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc)))
+      ('for (dolist (k (list (nth 1 node) (nth 4 node)))
+              (setq acc (nelisp-cfront-lower--collect-decl-types k acc))))
+      (_ nil)))
+  acc)
+
+(defun nelisp-cfront-lower--collect-func-types (program)
+  "Alist NAME->ret-type for `func'/`proto' top-levels in PROGRAM."
+  (let ((acc nil))
+    (dolist (top (cdr program))
+      (when (memq (car top) '(func proto))
+        (push (cons (nth 2 top) (nth 1 top)) acc)))
+    acc))
+
 ;;; --- expressions -----------------------------------------------------
 
 (defun nelisp-cfront-lower--expr (e)
@@ -84,17 +180,18 @@ names stay literal — the linker needs the original C symbol.)"
     ('var (nelisp-cfront-lower--lvar (nth 1 e)))
     ('str (nelisp-cfront-lower--err :string-literal-unsupported e)) ; needs rodata
     ('binop (nelisp-cfront-lower--binop (nth 1 e) (nth 2 e) (nth 3 e)))
-    ('unop (nelisp-cfront-lower--unop (nth 1 e) (nth 2 e)))
+    ('unop (if (string= (nth 1 e) "*")
+               (nelisp-cfront-lower--load-lvalue e)   ; typed deref
+             (nelisp-cfront-lower--unop (nth 1 e) (nth 2 e))))
     ('assign (nelisp-cfront-lower--assign (nth 1 e) (nth 2 e) (nth 3 e)))
     ('call (nelisp-cfront-lower--call (nth 1 e) (nth 2 e)))
     ('ternary `(if ,(nelisp-cfront-lower--cond (nth 1 e))
                    ,(nelisp-cfront-lower--expr (nth 2 e))
                  ,(nelisp-cfront-lower--expr (nth 3 e))))
-    ('index `(ptr-read-u64 ,(nelisp-cfront-lower--expr (nth 1 e))
-                           (* ,(nelisp-cfront-lower--expr (nth 2 e)) 8)))
+    ('index (nelisp-cfront-lower--load-lvalue e))      ; typed element load
     ('sizeof (nelisp-cfront-lower--sizeof (nth 1 e)))
     ((or 'pre 'post) (nelisp-cfront-lower--incdec e))
-    ((or 'member 'arrow) (nelisp-cfront-lower--err :struct-access-needs-layout e))
+    ((or 'member 'arrow) (nelisp-cfront-lower--load-lvalue e))
     (_ (nelisp-cfront-lower--err :unsupported-expr e))))
 
 (defun nelisp-cfront-lower--binop (op l r)
@@ -102,6 +199,13 @@ names stay literal — the linker needs the original C symbol.)"
         (gr (nelisp-cfront-lower--expr r))
         (g (cdr (assoc op nelisp-cfront-lower--binop-map))))
     (cond
+     ;; pointer +/- integer: scale the integer by the pointee size
+     ((and (member op '("+" "-"))
+           (> (or (plist-get (nelisp-cfront-lower--type-of l) :ptr) 0) 0)
+           (= 0 (or (plist-get (nelisp-cfront-lower--type-of r) :ptr) 0)))
+      (let ((es (nelisp-cfront-lower--elem-size l)))
+        (list (cdr (assoc op nelisp-cfront-lower--binop-map))
+              gl (if (= es 1) gr `(* ,gr ,es)))))
      (g (list g gl gr))
      ((string= op "!=") `(if (= ,gl ,gr) 0 1))
      ((string= op "&&") `(if ,(nelisp-cfront-lower--truth gl)
@@ -142,15 +246,17 @@ matches C, so the raw value is used directly."
                   (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
              (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
              `(setq ,name (,g ,name ,grhs))))))
-      ('unop                                  ; *p = e
-       (if (and (string= (nth 1 lhs) "*") (string= op "="))
-           `(ptr-write-u64 ,(nelisp-cfront-lower--expr (nth 2 lhs)) 0 ,grhs)
-         (nelisp-cfront-lower--err :unsupported-assign-target lhs)))
-      ('index                                 ; a[i] = e
-       (if (string= op "=")
-           `(ptr-write-u64 ,(nelisp-cfront-lower--expr (nth 1 lhs))
-                           (* ,(nelisp-cfront-lower--expr (nth 2 lhs)) 8) ,grhs)
-         (nelisp-cfront-lower--err :unsupported-assign-target lhs)))
+      ((or 'unop 'index 'arrow 'member)        ; memory lvalue: *p / a[i] / p->f / s.f
+       (let ((addr (nelisp-cfront-lower--addr lhs))
+             (width (nelisp-cfront-type-size (nelisp-cfront-lower--type-of lhs)
+                                             nelisp-cfront-lower--structs)))
+         (if (string= op "=")
+             (nelisp-cfront-lower--store-w addr width grhs)
+           (let* ((bop (substring op 0 (1- (length op))))
+                  (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+             (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
+             (nelisp-cfront-lower--store-w
+              addr width (list g (nelisp-cfront-lower--load-w addr width) grhs))))))
       (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
 (defun nelisp-cfront-lower--call (fn args)
@@ -285,6 +391,10 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                                                     (nelisp-cfront-lower--lvar (nth 2 p))))
                                    params)))
          (locals (nreverse (delete-dups (nelisp-cfront-lower--collect-decls body nil))))
+         (nelisp-cfront-lower--tenv
+          (append (delq nil (mapcar (lambda (p) (and (nth 2 p) (cons (nth 2 p) (nth 1 p))))
+                                    params))
+                  (nelisp-cfront-lower--collect-decl-types body nil)))
          (body-g (nelisp-cfront-lower--block-tail body void-p))
          (wrapped (if locals
                       `(let ,(mapcar (lambda (v)
@@ -301,12 +411,15 @@ Includes the `nelisp_cfront__zero' helper.  Globals/prototypes are
 skipped in the MVP (functions only)."
   (unless (eq (car ast) 'program)
     (nelisp-cfront-lower--err :not-a-program ast))
-  (let ((funcs nil))
+  (let ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
+        (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
+        (funcs nil))
     (dolist (top (cdr ast))
       (pcase (car top)
         ('func (push (nelisp-cfront-lower--func top) funcs))
         ('proto nil)                          ; ignore prototypes
         ('global nil)                         ; MVP: globals deferred
+        ('struct-def nil)                     ; layout already in the table
         (_ (nelisp-cfront-lower--err :unsupported-toplevel top))))
     (cons 'seq
           (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)

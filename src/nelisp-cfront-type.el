@@ -1,0 +1,169 @@
+;;; nelisp-cfront-type.el --- C type sizing, struct layout, inference -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 zawatton
+
+;; Author: zawatton <kurozawawo@gmail.com>
+
+;; This file is not part of GNU Emacs.
+
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+
+;; M2.3 — type sizes, struct field layout (offset/size + alignment), and
+;; a light expression type-inference used by the lowering to pick the
+;; right memory width for `p->f', `*p', `a[i]', and to scale pointer
+;; arithmetic by the pointee size.
+;;
+;; A type is the parser's plist: (:base SYM :ptr N [:unsigned t]
+;; [:struct NAME] [:fields ...] [:array SZ]).  BASE in
+;; (void char short int long struct).  An LP64 model is assumed
+;; (char1 short2 int4 long8 ptr8).
+;;
+;; A struct table maps "NAME" -> (:size N :align A :fields ALIST) where
+;; ALIST is ((FNAME . (:type TY :offset O :size S)) ...).
+
+;;; Code:
+
+(require 'cl-lib)
+
+(define-error 'nelisp-cfront-type-error "nelisp-cfront type error")
+
+(defun nelisp-cfront-type--scalar-size (base)
+  (pcase base
+    ('char 1) ('short 2) ('int 4) ('long 8) ('void 1)
+    (_ (signal 'nelisp-cfront-type-error (list :unknown-base base)))))
+
+(defun nelisp-cfront-type-size (ty structs)
+  "Byte size of type TY given the STRUCTS table."
+  (let ((ptr (or (plist-get ty :ptr) 0))
+        (arr (plist-get ty :array)))
+    (cond
+     ((and arr (> ptr 0)) 8)            ; array of pointers element handled elsewhere
+     (arr (* (nelisp-cfront-type-size
+              (nelisp-cfront-type--strip-array ty) structs)
+             (nelisp-cfront-type--const arr)))
+     ((> ptr 0) 8)
+     ((eq (plist-get ty :base) 'struct)
+      (let ((s (nelisp-cfront-type-struct (plist-get ty :struct) structs)))
+        (plist-get s :size)))
+     (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
+
+(defun nelisp-cfront-type-align (ty structs)
+  "Alignment of TY."
+  (let ((ptr (or (plist-get ty :ptr) 0)))
+    (cond
+     ((> ptr 0) 8)
+     ((plist-get ty :array)
+      (nelisp-cfront-type-align (nelisp-cfront-type--strip-array ty) structs))
+     ((eq (plist-get ty :base) 'struct)
+      (plist-get (nelisp-cfront-type-struct (plist-get ty :struct) structs) :align))
+     (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
+
+(defun nelisp-cfront-type--strip-array (ty)
+  (let ((out nil) (p ty))
+    (while p
+      (unless (eq (car p) :array) (setq out (cons (car p) (cons (cadr p) out))))
+      (setq p (cddr p)))
+    (nreverse out)))
+
+(defun nelisp-cfront-type--const (expr)
+  "Evaluate a constant array-size EXPR (MVP: int literal only)."
+  (if (and (consp expr) (eq (car expr) 'int)) (nth 1 expr)
+    (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr))))
+
+(defun nelisp-cfront-type--round-up (n a) (* (/ (+ n a -1) a) a))
+
+(defun nelisp-cfront-type-layout (fields structs)
+  "Compute layout for struct FIELDS (a list of (field TY NAME)).
+Returns (:size N :align A :fields ALIST)."
+  (let ((off 0) (align 1) (alist nil))
+    (dolist (f fields)
+      (let* ((ty (nth 1 f)) (name (nth 2 f))
+             (sz (nelisp-cfront-type-size ty structs))
+             (al (nelisp-cfront-type-align ty structs)))
+        (setq off (nelisp-cfront-type--round-up off al))
+        (push (cons name (list :type ty :offset off :size sz)) alist)
+        (setq off (+ off sz))
+        (setq align (max align al))))
+    (list :size (nelisp-cfront-type--round-up off align)
+          :align align
+          :fields (nreverse alist))))
+
+(defun nelisp-cfront-type-build-structs (program)
+  "Build the struct table from PROGRAM `(program TOP...)'.
+Also scans inline `:fields' on struct types in params/decls."
+  (let ((structs nil))
+    (dolist (top (cdr program))
+      (when (eq (car top) 'struct-def)
+        (let ((name (nth 1 top)) (fields (nth 2 top)))
+          (when (and name fields)
+            (push (cons name (nelisp-cfront-type-layout fields structs)) structs)))))
+    structs))
+
+(defun nelisp-cfront-type-struct (name structs)
+  (or (cdr (assoc name structs))
+      (signal 'nelisp-cfront-type-error (list :unknown-struct name))))
+
+(defun nelisp-cfront-type-field (struct-name field structs)
+  "Return (:type TY :offset O :size S) for FIELD of STRUCT-NAME."
+  (or (cdr (assoc field (plist-get (nelisp-cfront-type-struct struct-name structs)
+                                   :fields)))
+      (signal 'nelisp-cfront-type-error (list :unknown-field struct-name field))))
+
+;;; --- type plist helpers ---------------------------------------------
+
+(defun nelisp-cfront-type-pointee (ty)
+  "Type pointed to by pointer type TY (decrement :ptr)."
+  (let ((ptr (or (plist-get ty :ptr) 0)))
+    (when (= ptr 0)
+      (signal 'nelisp-cfront-type-error (list :deref-non-pointer ty)))
+    (plist-put (copy-sequence ty) :ptr (1- ptr))))
+
+(defun nelisp-cfront-type-int () '(:base int :ptr 0))
+(defun nelisp-cfront-type-long () '(:base long :ptr 0))
+
+;;; --- expression type inference --------------------------------------
+
+(defun nelisp-cfront-type-of (expr tenv structs funcs)
+  "Infer the C type of EXPR.
+TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
+  (pcase (car expr)
+    ('int (nelisp-cfront-type-long))
+    ('str (list :base 'char :ptr 1))
+    ('var (or (cdr (assoc (nth 1 expr) tenv)) (nelisp-cfront-type-long)))
+    ('arrow
+     (let* ((pty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs))
+            (sname (plist-get pty :struct)))
+       (plist-get (nelisp-cfront-type-field sname (nth 2 expr) structs) :type)))
+    ('member
+     (let* ((oty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs))
+            (sname (plist-get oty :struct)))
+       (plist-get (nelisp-cfront-type-field sname (nth 2 expr) structs) :type)))
+    ('index
+     (nelisp-cfront-type-pointee
+      (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs)))
+    ('unop
+     (pcase (nth 1 expr)
+       ("*" (nelisp-cfront-type-pointee
+             (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
+       ("&" (let ((it (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
+              (plist-put (copy-sequence it) :ptr (1+ (or (plist-get it :ptr) 0)))))
+       (_ (nelisp-cfront-type-long))))
+    ('call
+     (let ((fn (nth 1 expr)))
+       (or (and (eq (car fn) 'var) (cdr (assoc (nth 1 fn) funcs)))
+           (nelisp-cfront-type-long))))
+    ('binop
+     ;; pointer +/- integer keeps the pointer type; else numeric
+     (let ((lt (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
+       (if (and (member (nth 1 expr) '("+" "-")) (> (or (plist-get lt :ptr) 0) 0))
+           lt
+         (nelisp-cfront-type-long))))
+    ('assign (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
+    ('ternary (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
+    (_ (nelisp-cfront-type-long))))
+
+(provide 'nelisp-cfront-type)
+
+;;; nelisp-cfront-type.el ends here

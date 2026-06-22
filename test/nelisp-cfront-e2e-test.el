@@ -94,6 +94,37 @@ int main(void){
     (should (equal "310 1 2 0" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-e2e-structs-pointers-arrays ()
+  "M2.3: struct field rw (typed widths/offsets), array indexing, pointers."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+struct Point { long x; long y; };
+long dist2(struct Point *p){ return p->x * p->x + p->y * p->y; }
+void setp(struct Point *p, long x, long y){ p->x = x; p->y = y; }
+long arr_sum(long *a, long n){ long s = 0; for (long i = 0; i < n; i = i + 1) s = s + a[i]; return s; }
+struct Rec { int a; int b; long c; };
+long recsum(struct Rec *r){ return r->a + r->b + r->c; }
+void recset(struct Rec *r){ r->a = 100; r->b = 200; r->c = 300; }
+")
+         (drv "
+#include <stdio.h>
+struct Point { long x; long y; };
+struct Rec { int a; int b; long c; };
+extern long dist2(struct Point*); extern void setp(struct Point*, long, long);
+extern long arr_sum(long*, long); extern long recsum(struct Rec*); extern void recset(struct Rec*);
+int main(void){
+  struct Point pt; setp(&pt, 3, 4); long d = dist2(&pt);
+  long a[5] = {10,20,30,40,50}; long s = arr_sum(a, 5);
+  struct Rec r; recset(&r); long rs = recsum(&r);
+  printf(\"%ld %ld %ld %ld %ld %d %d %ld\\n\", d, s, pt.x, pt.y, rs, r.a, r.b, r.c);
+  return (d==25 && s==150 && pt.x==3 && pt.y==4 && rs==600 && r.a==100 && r.b==200 && r.c==300) ? 0 : 1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "25 150 3 4 600 100 200 300" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-e2e-test)
 
 ;;; nelisp-cfront-e2e-test.el ends here
