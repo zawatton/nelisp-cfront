@@ -38,8 +38,8 @@ asserted.
 | M2.3 | typecheck + layout | struct offsets/sizes/align, int widths, array index | |
 | M2.4 | lowering AST → grammar | Doc 02 scheme; emits compilable grammar | |
 | M2.5 | CLI driver | =make cc FILE=foo.c= → .o; link+run a real C program | *= MVP-complete* |
-| M3 | libc-in-grammar | memcpy/memset/str*/malloc-free(slab); non-trivial C runs | |
-| M4 | hard-tail C | varargs, fn-ptrs, goto, struct-by-value, unions/bitfields; +u16/u32 ops, no-param init helper | |
+| M3 | libc-in-grammar | mem/str done (in C, self-compiled); malloc/free(slab) next | *partial* |
+| M4 | hard-tail C | early-return-in-loop (break/flag), varargs, fn-ptrs, goto, struct-by-value, unions/bitfields; +native u16/u32 ops | |
 | M5 | SQLite | amalgamation compiles; nelisp-sqlite uses it | *= v1.0 / 脱ライブラリ* |
 | M6 | libxml2 | compiles; nelisp-http uses it (drops host libxml + regex fallback) | *= v1.0 / 脱ライブラリ* |
 
