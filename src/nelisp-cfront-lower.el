@@ -84,6 +84,11 @@ names stay literal — the linker needs the original C symbol.)"
                          nelisp-cfront-lower--structs
                          nelisp-cfront-lower--funcs))
 
+(defun nelisp-cfront-lower--var-is-function-p (name)
+  "Non-nil when NAME denotes a function (not shadowed by a local/param)."
+  (and (not (assoc name nelisp-cfront-lower--tenv))
+       (assoc name nelisp-cfront-lower--funcs)))
+
 (defun nelisp-cfront-lower--load-w (addr width)
   "Load WIDTH bytes from grammar address ADDR (offset folded into ADDR)."
   (pcase width
@@ -186,7 +191,10 @@ names stay literal — the linker needs the original C symbol.)"
 (defun nelisp-cfront-lower--expr (e)
   (pcase (car e)
     ('int (nth 1 e))
-    ('var (nelisp-cfront-lower--lvar (nth 1 e)))
+    ('var (let ((name (nth 1 e)))
+            (if (nelisp-cfront-lower--var-is-function-p name)
+                `(addr-of ,(nelisp-cfront-lower--sym name)) ; function -> pointer
+              (nelisp-cfront-lower--lvar name))))
     ('str (nelisp-cfront-lower--err :string-literal-unsupported e)) ; needs rodata
     ('binop (nelisp-cfront-lower--binop (nth 1 e) (nth 2 e) (nth 3 e)))
     ('unop (if (string= (nth 1 e) "*")
@@ -240,7 +248,10 @@ matches C, so the raw value is used directly."
       ("!" `(if (= ,g 0) 1 0))
       ("~" `(logxor ,g -1))
       ("*" `(ptr-read-u64 ,g 0))              ; MVP: 8-byte deref
-      ("&" (nelisp-cfront-lower--err :addr-of-unsupported e))
+      ("&" (if (and (consp e) (eq (car e) 'var)
+                    (nelisp-cfront-lower--var-is-function-p (nth 1 e)))
+               `(addr-of ,(nelisp-cfront-lower--sym (nth 1 e)))
+             (nelisp-cfront-lower--err :addr-of-unsupported e))) ; &local: M4 follow-on
       (_ (nelisp-cfront-lower--err :unsupported-unop op)))))
 
 (defun nelisp-cfront-lower--assign (op lhs rhs)
@@ -269,10 +280,16 @@ matches C, so the raw value is used directly."
       (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
 (defun nelisp-cfront-lower--call (fn args)
-  (unless (eq (car fn) 'var)
-    (nelisp-cfront-lower--err :function-pointer-call-unsupported fn))
-  (cons (nelisp-cfront-lower--sym (nth 1 fn))
-        (mapcar #'nelisp-cfront-lower--expr args)))
+  (let ((gargs (mapcar #'nelisp-cfront-lower--expr args)))
+    (if (and (eq (car fn) 'var)
+             (nelisp-cfront-lower--var-is-function-p (nth 1 fn)))
+        ;; direct call to a named function
+        (cons (nelisp-cfront-lower--sym (nth 1 fn)) gargs)
+      ;; indirect call through a function-pointer value: fp(...) / (*fp)(...)
+      (let ((target (if (and (eq (car fn) 'unop) (string= (nth 1 fn) "*"))
+                        (nth 2 fn)
+                      fn)))
+        (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs))))))
 
 (defun nelisp-cfront-lower--incdec (e)
   "Lower ++/-- (pre or post).  Returns the assigned value (exact for pre
