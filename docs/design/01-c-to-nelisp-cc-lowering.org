@@ -1,0 +1,174 @@
+#+TITLE: Doc 01 — C → nelisp-cc grammar lowering (feasibility spike)
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-22
+#+STATUS: DRAFT — spike design
+
+* §0 Summary
+
+=nelisp-cfront= lowers C onto the =nelisp-cc= grammar (the s-expression
+systems language =nelisp= AOT-compiles to native x86_64/arm64).  This is
+the same architecture as =modernc.org/ccgo= (C→Go on =unsafe.Pointer= +
+re-implemented libc), except the back-end emits native code instead of
+interpreting.
+
+This doc designs a *feasibility spike*: measure whether C semantics fit
+the existing grammar, and where the walls are, *before* building a C99
+front-end or a libc.  Output = a grammar-coverage / cost-curve report
+that decides go/no-go on the full build.
+
+* §1 Why this is plausible (verified substrate)
+
+The =nelisp-cc= grammar already AOT-compiles a systems subset to native.
+Every op below was verified in the =nelisp= source (do not rely on an op
+without re-verifying):
+
+| grammar op | C construct | evidence (nelisp repo) |
+|------------+-------------+------------------------|
+| =ptr-read-u8/u64=, =ptr-write-u8/u64= | =*p=, =p[i]=, =s->f= | =lisp/nelisp-cc-atomic-raw-mem.el= |
+| =atomic-fetch-add=, =atomic-compare-exchange= | C11 atomics | =lisp/nelisp-cc-atomic-raw-mem.el= |
+| =syscall-direct NR a0..a5= | OS / libc bottom | =lisp/nelisp-cc-alloc-mem.el= |
+| =nl_mmap_alloc=, =nl_mmap_dealloc= | =malloc/free= | =lisp/nelisp-cc-alloc-mem.el= |
+| syscall nr table (read/write/openat/close/lseek/mmap/munmap…) | libc I/O | =lisp/nelisp-syscall-table.el= |
+| =while= | =for/while= | =lisp/nelisp-cc-sf-while.el= |
+| arith (=+ - logand= …), =cmp= (=< > =), =if/cond/and= | expressions, control | =cc= pipeline |
+| f64 ops, int truncation | =double=, narrow ints | =cc-jit-float=, =cc-truncate-int= |
+| =defun=, =seq= (multi-defun manifest) | functions, TU | grammar |
+
+Toolchain entry: =nelisp-aot-compile-to-object= (=nelisp/lisp/nelisp-aot-compiler.el=
+~L16353).  Existing probe runner: =nelisp/scripts/compile-elisp-objects.el=
+(registers =:source-var <X>--source= probes; =nelisp-cc-spike-noop= is
+the precedent).
+
+* §2 Architecture
+
+#+begin_src text
+  C source
+     │  [front-end: lex → parse → typecheck → C-AST]   ← KNOWN-doable; DEFERRED
+     ▼
+  C-AST
+     │  [lowering: C-AST → nelisp-cc grammar sexp]      ← the UNKNOWN; spike subject
+     ▼
+  nelisp-cc grammar
+     │  nelisp-aot-compile-to-object        (nelisp)
+     ▼
+  ET_REL .o → link → native execution
+#+end_src
+
+De-risk decision: *the spike does not build the C front-end.*  C is
+hand-lowered to grammar sexps so the spike isolates the *semantic/runtime
+fit* (unknown) from *parsing C* (a standard, known-tractable task).
+=src/nelisp-cfront.el= ships the per-construct lowering helpers the
+front-end will eventually call.
+
+* §3 Spike stages
+
+Each stage: a C snippet, its hand-lowered grammar, what it proves, and
+the expected wall.
+
+** Stage 0 — harness (~0.5 d)
+
+Establish compile → link → run before any C semantics.
+
+#+begin_src emacs-lisp
+  (defconst stage0--source '(defun stage0_add (a b) (+ a b)))
+  ;; nelisp-aot-compile-to-object → .o → link → call → expect 7
+#+end_src
+
+Proves: the round-trip works.  Reuses =nelisp-cc-spike-noop= /
+=compile-elisp-objects.el=.  Implemented (skeleton) in
+=spike/stage0-harness.el=; first task is to confirm the live API + wire
+the link/run step.
+
+** Stage 1 — int-only C (~1.5 d)
+
+#+begin_src c
+  int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+  uint8_t narrow(int x){ return x; }
+#+end_src
+
+#+begin_src emacs-lisp
+  (defun sum (n)
+    (let ((s 0) (i 0))
+      (while (< i n) (setq s (+ s i)) (setq i (+ i 1)))   ; exact mutation form: confirm in Stage 1
+      s))
+  (defun narrow (x) (logand x 255))
+#+end_src
+
+Proves: arith / cmp / while / locals / narrow-int mask.
+Wall candidates: signed↔unsigned division, integer-promotion rules.
+
+** Stage 2 — pointer + memory + struct (~2 d)
+
+#+begin_src c
+  struct P { int x; long y; };          /* x@0, y@8 — front-end computes layout */
+  long rw(void){ struct P*p=malloc(16); p->x=5; p->y=99; return p->x + p->y; }
+#+end_src
+
+#+begin_src emacs-lisp
+  (defun rw ()
+    (let ((p (nl_mmap_alloc 16 8)))
+      (ptr-write-u64 p 0 5)
+      (ptr-write-u64 p 8 99)
+      (+ (ptr-read-u64 p 0) (ptr-read-u64 p 8))))
+#+end_src
+
+Proves: a real (mmap) memory machine — native memory, not emulation.
+*First real gap*: =u16/u32= native loads (compose from u8, or add a
+grammar op), alignment, pointer-to-pointer.
+
+** Stage 3 — one syscall / file I/O (~1.5 d)
+
+#+begin_src c
+  write(1, "hi\n", 3);                   /* then openat→read→close one file */
+#+end_src
+
+#+begin_src emacs-lisp
+  (defun emit_hi (bufptr) (syscall-direct 1 1 bufptr 3 0 0 0))  ; write(1, buf, 3)
+#+end_src
+
+Proves: the libc/VFS boundary with no Rust.  Table has write=1, openat=257,
+read=0, close=3, lseek=8.  Wall candidates: errno, buffered stdio,
+string↔C-buffer marshaling.
+
+* §4 Decision-gate output (the cost curve)
+
+After Stage 3, emit a *grammar-coverage report* classifying each C
+construct seen as:
+
+1. 1:1 — maps to an existing grammar op,
+2. composed — built from existing ops,
+3. needs a new grammar op (cost: extend =nelisp-cc=),
+4. needs a libc implementation (cost: write it in the grammar).
+
+Then enumerate the libc surface a real target (e.g. SQLite) needs —
+=malloc/memcpy/str*/printf-family/qsort/vfs file-lock= — and assign each
+to 1–4.  That report decides whether to build the C99 front-end +
+libc-in-grammar.
+
+* §5 Honest residual risks (NOT in the spike)
+
+- Hard-tail C (the features Vacietis could not do, that SQLite uses):
+  =goto=, struct-by-value args/returns, varargs (printf-family — heavy in
+  SQLite), function pointers (VDBE), unions/bitfields, =setjmp=.
+- Leaf-op Rust dependency: =ptr-read-u64= etc. currently route through
+  Rust externs (=nl_ptr_read_u64=).  Full pure-elisp end-to-end is gated
+  on the =nelisp= Doc 122-128 leaf migration.  The =nelisp-cfront=
+  front-end is pure elisp regardless.
+
+* §6 Scope / effort / reuse
+
+| | |
+|--+--|
+| spike effort | Stage 0-3 hand-lowered, ~1 week |
+| reuse (do not build) | =nelisp-aot-compile-to-object=, =compile-elisp-objects.el=, grammar ops, =syscall-table=, =nl_mmap_alloc=, =nelisp-cc-spike-noop= |
+| build (spike) | hand-lowered sources + ERT + the gap report |
+| build (if go) | C99 front-end → libc-in-grammar subset → first real target |
+| NOT in spike | C parser, libc, SQLite |
+
+* §7 Synergy with the nelisp charter
+
+The grammar maturity C needs (struct walks via ptr ops, narrow ints,
+syscalls) is the same maturity =nelisp= is already building for Doc
+122-128 (refcount / Clone / Drop / alloc elisp化).  Investing in the
+grammar serves both the C front-end and nelisp's own Rust-reduction
+goal.

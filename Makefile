@@ -1,0 +1,50 @@
+.PHONY: test compile clean stage0 help
+
+EMACS ?= emacs
+
+# Sibling nelisp repo (provides nelisp-aot-compile-to-object + grammar).
+NELISP_REPO_ROOT ?= ../nelisp
+export NELISP_REPO_ROOT
+
+# Load-path: this repo's src + nelisp lisp/src.
+LOADPATH = -L src \
+           -L $(NELISP_REPO_ROOT)/lisp \
+           -L $(NELISP_REPO_ROOT)/src
+
+# MSYS sane temp defaults (mirrors nelisp Makefile).
+export TMPDIR ?= /tmp
+export TEMP   ?= /tmp
+export TMP    ?= /tmp
+
+help:
+	@echo "targets:"
+	@echo "  make test     — run ERT suite (test/*-test.el)"
+	@echo "  make compile  — byte-compile src/"
+	@echo "  make stage0   — run the compile->link->run round-trip probe"
+	@echo "  make clean     — remove build artifacts"
+	@echo ""
+	@echo "vars: NELISP_REPO_ROOT=$(NELISP_REPO_ROOT)  EMACS=$(EMACS)"
+
+test:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront \
+	  -l test/nelisp-cfront-test.el \
+	  -f ert-run-tests-batch-and-exit
+
+compile:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  --eval '(setq byte-compile-error-on-warn nil)' \
+	  -f batch-byte-compile src/nelisp-cfront.el
+
+# Stage 0 feasibility probe: hand-lowered grammar source -> .o -> run.
+# This target is expected to FAIL until the harness wiring is verified
+# against the running nelisp AOT toolchain — it is the first spike task.
+stage0:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront \
+	  -l spike/stage0-harness.el \
+	  --eval '(nelisp-cfront-stage0-run)'
+
+clean:
+	rm -f src/*.elc test/*.elc spike/*.elc
+	rm -rf spike/out target build

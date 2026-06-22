@@ -1,0 +1,99 @@
+#+TITLE: nelisp-cfront — C front-end that lowers to the nelisp-cc grammar
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-22
+#+STATUS: early / exploratory (feasibility spike)
+
+* Status — read this first
+
+This is an *early, exploratory research project*.  It is *not* a usable
+C compiler and may never become one.  The current goal is a *feasibility
+spike*, not a product: measure whether C semantics can be lowered onto
+the existing =nelisp-cc= AOT grammar, and where the walls are.
+
+Nothing here is committed to long-term support.  Breaking changes are
+expected on most commits.
+
+* Purpose
+
+=nelisp-cfront= is the *C front-end* of the NeLisp toolchain.  It takes
+C source and lowers it onto the =nelisp-cc= grammar (the s-expression
+systems-language that =nelisp= AOT-compiles to native x86_64/arm64).
+
+#+begin_src text
+  C source
+     │  [front-end: lex → parse → typecheck → C-AST]      (deferred in the spike)
+     ▼
+  C-AST
+     │  [lowering: C-AST → nelisp-cc grammar sexp]         (the spike's subject)
+     ▼
+  nelisp-cc grammar
+     │  nelisp-aot-compile-to-object  (provided by nelisp)
+     ▼
+  ET_REL .o → link → native execution
+#+end_src
+
+Role split, mirroring a real toolchain (cpp / cfront / cc1):
+
+- =nelisp-cc= (in the =nelisp= repo) = *back-end*: grammar → native.
+- =nelisp-cfront= (this repo)        = *front-end*: C → grammar.
+
+The name follows Stroustrup's =cfront= (the original C++→C transpiler):
+a front-end that lowers onto an existing back-end.
+
+* Why this is plausible (and where it is hard)
+
+The =nelisp-cc= grammar already AOT-compiles a *systems* subset to
+native code:
+
+| grammar op | C construct it serves | evidence (nelisp repo) |
+|------------+-----------------------+------------------------|
+| =ptr-read/write-u8/u64= | =*p=, =p[i]=, =s->f= | =lisp/nelisp-cc-atomic-raw-mem.el= |
+| =syscall-direct NR a0..a5= | OS / libc bottom | =lisp/nelisp-cc-alloc-mem.el=, =lisp/nelisp-syscall-table.el= |
+| =nl_mmap_alloc/dealloc= | =malloc/free= | =lisp/nelisp-cc-alloc-mem.el= |
+| =while= | =for/while= | =lisp/nelisp-cc-sf-while.el= |
+| arith / =cmp= / =logand= / =if= / =cond= / =and= | expressions, control | =cc= pipeline |
+| f64 ops / int truncation | =double=, narrow ints | =cc-jit-float=, =cc-truncate-int= |
+
+So the lowering target is the same shape as =modernc.org/ccgo= (C→Go on
+=unsafe.Pointer= + a re-implemented libc) — except native code is
+emitted by =nelisp-cc=, not interpreted.  The genuine cost is the
+*front-end* (C99 parse/typecheck/lower) plus a *libc subset* expressed
+in the grammar.  See =docs/design/01-c-to-nelisp-cc-lowering.org=.
+
+Known hard tail (not in the spike): =goto=, struct-by-value, varargs,
+function pointers, unions/bitfields, =setjmp=.  Also: =nelisp-cc= leaf
+ops (=ptr-read-u64= …) currently route through Rust externs; full
+pure-elisp end-to-end depends on the =nelisp= Doc 122-128 leaf
+migration.
+
+* Dependencies
+
+- =nelisp= core (sibling repo): provides =nelisp-aot-compile-to-object=
+  and the grammar.  Resolved via load-path; root defaults to
+  =../nelisp= and is overridable by =NELISP_REPO_ROOT=.
+- Emacs 29+ (for batch ERT and the host build of the spike harness).
+
+* Layout
+
+#+begin_src text
+  nelisp-cfront/
+  ├── README.org
+  ├── AGENTS.md / CLAUDE.md
+  ├── Makefile
+  ├── src/nelisp-cfront.el            — lowering helpers + (stub) entry points
+  ├── test/nelisp-cfront-test.el      — ERT
+  ├── spike/stage0-harness.el         — compile → link → run round-trip probe
+  └── docs/design/01-c-to-nelisp-cc-lowering.org
+#+end_src
+
+* Spike plan (see Doc 01 for detail)
+
+| stage | proves | grammar exercised |
+|-------+--------+-------------------|
+| 0 harness | compile → link → run round-trip | (any defun) |
+| 1 int-only C | arith / cmp / while / narrow-int mask | =while=, =logand=, arith |
+| 2 ptr + struct | real (mmap) memory machine | =ptr-*=, =nl_mmap_alloc= |
+| 3 one syscall | libc/VFS boundary without Rust | =syscall-direct= |
+
+Output = a grammar-coverage / cost-curve report that decides whether to
+build the C99 front-end + libc-in-grammar.

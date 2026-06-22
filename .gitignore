@@ -1,0 +1,38 @@
+# Elisp byte-compiled / native
+*.elc
+*.eln
+
+# C / object artifacts produced by the lowering pipeline + spike
+*.o
+*.a
+*.out
+/spike/out/
+
+# Backups / autosaves
+*~
+\#*\#
+.\#*
+*.bak
+
+# Build / test output
+/build/
+/dist/
+/target/
+target/
+
+# Coverage
+/coverage/
+*.lcov
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# Project-local scratch
+/scratch/
+/tmp/
+
+# Secrets / env
+.env
+.env.local
