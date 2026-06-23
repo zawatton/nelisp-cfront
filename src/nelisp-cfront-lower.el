@@ -70,6 +70,19 @@ arrays, struct-by-value, and address-taken scalars.  Such a variable's
 grammar slot holds the *address* of a `frame-alloc' block; an aggregate
 decays to that address, a scalar is read/written through it.")
 
+(defvar nelisp-cfront-lower--globals nil
+  "Alist NAME->(:type TY :bytes UNIBYTE) of read-only integer global
+scalars/arrays with a constant initializer (Doc 06 Step B).  Each is
+emitted as a `data-blob' in `.rodata' and referenced via `(data-addr
+NAME)'.  Globals not in this table (no/non-const/non-integer init, or
+struct/pointer globals) are left for Step C and keep their old behaviour.")
+
+(defvar nelisp-cfront-lower--local-names nil
+  "List of the current function's param + local variable NAMEs (strings).
+A `var' whose name is here is a local/param (lowers to its grammar slot);
+otherwise a name present in `--globals' is a global (lowers via
+`data-addr').  Locals therefore shadow same-named globals.")
+
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
 
@@ -160,6 +173,85 @@ NODE cons tree into ACC (a full car/cdr walk, so arg lists are covered)."
     (setq acc (nelisp-cfront-lower--collect-addr-taken (car node) acc))
     (nelisp-cfront-lower--collect-addr-taken (cdr node) acc))
    (t acc)))
+
+;;; --- read-only integer global data (Doc 06 Step B) ------------------
+
+(defun nelisp-cfront-lower--global-var-p (name)
+  "Non-nil when NAME refers to a const integer global (in `--globals') and
+is not shadowed by a param/local of the current function."
+  (and (not (member name nelisp-cfront-lower--local-names))
+       (assoc name nelisp-cfront-lower--globals)))
+
+(defun nelisp-cfront-lower--pack-int (v width)
+  "Pack integer V into a little-endian unibyte string of WIDTH bytes,
+masking to the low WIDTH*8 bits (so negatives wrap two's-complement)."
+  (let ((u (logand v (1- (ash 1 (* 8 width)))))
+        (bytes nil))
+    (dotimes (i width) (push (logand (ash u (* -8 i)) 255) bytes))
+    (apply #'unibyte-string (nreverse bytes))))
+
+(defun nelisp-cfront-lower--global-bytes (ty init)
+  "Return the `.rodata' unibyte image of a read-only integer global of type
+TY with initializer INIT, or nil when it is not a const integer
+scalar/array this step handles (signals on a non-constant element so the
+caller skips the whole global).  Element widths 1/2/4/8 are supported;
+arrays zero-pad to their declared dimension."
+  (let ((arr (plist-get ty :array)))
+    (cond
+     ;; --- integer array: {e, ...} or "string" for char[] ---
+     (arr
+      (let* ((elem-ty (nelisp-cfront-type--strip-array ty)))
+        ;; Step B handles flat (single-dimension) integer arrays only.
+        (when (and (null (plist-get elem-ty :array))
+                   (= 0 (or (plist-get elem-ty :ptr) 0))
+                   (memq (plist-get elem-ty :base) '(char short int long)))
+          (let* ((w (nelisp-cfront-type-size elem-ty nelisp-cfront-lower--structs))
+                 (declared (and (integerp arr) arr)))
+            (cond
+             ((and (consp init) (eq (car init) 'init-list))
+              (let* ((elts (cdr init))
+                     (packed (mapconcat
+                              (lambda (e)
+                                (nelisp-cfront-lower--pack-int
+                                 (nelisp-cfront-parse--const-eval e) w))
+                              elts ""))
+                     (total (* (or declared (length elts)) w)))
+                (cond ((= (length packed) total) packed)
+                      ((< (length packed) total)
+                       (concat packed (make-string (- total (length packed)) 0)))
+                      (t (substring packed 0 total)))))
+             ;; char x[] = "..."  (NUL-terminated; padded to declared size)
+             ((and (consp init) (eq (car init) 'str) (= w 1))
+              (let* ((s (encode-coding-string (nth 1 init) 'utf-8 t))
+                     (total (or declared (1+ (length s))))
+                     (buf (make-string total 0)))
+                (dotimes (j (min (length s) total)) (aset buf j (aref s j)))
+                buf))
+             (t nil))))))
+     ;; --- integer scalar with a constant initializer ---
+     ((and init
+           (= 0 (or (plist-get ty :ptr) 0))
+           (memq (plist-get ty :base) '(char short int long)))
+      (nelisp-cfront-lower--pack-int
+       (nelisp-cfront-parse--const-eval init)
+       (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)))
+     (t nil))))
+
+(defun nelisp-cfront-lower--collect-globals (ast)
+  "Return an alist NAME->(:type TY :bytes UNIBYTE) for every const integer
+global scalar/array in AST `(program TOP...)'.  Non-constant or
+non-integer globals are skipped (left for Step C)."
+  (let ((out nil))
+    (dolist (top (cdr ast))
+      (when (eq (car top) 'global)
+        (let ((ty (nth 1 top)) (name (nth 2 top)) (init (nth 3 top)))
+          (when init
+            (condition-case nil
+                (let ((bytes (nelisp-cfront-lower--global-bytes ty init)))
+                  (when (and bytes (not (assoc name out)))
+                    (push (cons name (list :type ty :bytes bytes)) out)))
+              (error nil))))))           ; non-foldable -> skip this global
+    (nreverse out)))
 
 ;;; --- soft-float conversions (double carried as i64 bits) ------------
 
@@ -257,9 +349,12 @@ descending word widths (u64/u32/u16/u8) at constant offsets."
 (defun nelisp-cfront-lower--addr (e)
   "Grammar address of lvalue E (deref / index / arrow / member / var)."
   (pcase (car e)
-    ('var (if (nelisp-cfront-lower--mem-var (nth 1 e))
-              (nelisp-cfront-lower--lvar (nth 1 e))   ; frame-alloc block address
-            (nelisp-cfront-lower--err :addr-of-non-memory-var e)))
+    ('var (cond
+           ((nelisp-cfront-lower--mem-var (nth 1 e))
+            (nelisp-cfront-lower--lvar (nth 1 e)))    ; frame-alloc block address
+           ((nelisp-cfront-lower--global-var-p (nth 1 e))
+            `(data-addr ,(intern (nth 1 e))))         ; rodata global symbol address
+           (t (nelisp-cfront-lower--err :addr-of-non-memory-var e))))
     ('unop (if (string= (nth 1 e) "*")
                (nelisp-cfront-lower--expr (nth 2 e))
              (nelisp-cfront-lower--err :not-an-lvalue e)))
@@ -413,6 +508,10 @@ so positions stay aligned to call arguments."
                (nelisp-cfront-lower--lvar name)
                (nelisp-cfront-type-size (cdr (nelisp-cfront-lower--mem-var name))
                                         nelisp-cfront-lower--structs)))
+             ((nelisp-cfront-lower--global-var-p name)
+              ;; rodata global: a scalar loads through `(data-addr NAME)',
+              ;; an array/struct decays to that address (handled by --rvalue).
+              (nelisp-cfront-lower--rvalue e))
              ;; aggregate local decays to its block address (= the slot value);
              ;; plain scalar reads its value slot directly.
              (t (nelisp-cfront-lower--lvar name)))))
@@ -1024,10 +1123,16 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                                                     (nelisp-cfront-lower--lvar (nth 2 p))))
                                    params)))
          (locals (nreverse (delete-dups (nelisp-cfront-lower--collect-decls body nil))))
+         (nelisp-cfront-lower--local-names
+          (append (delq nil (mapcar (lambda (p) (nth 2 p)) params)) locals))
          (nelisp-cfront-lower--tenv
           (append (delq nil (mapcar (lambda (p) (and (nth 2 p) (cons (nth 2 p) (nth 1 p))))
                                     params))
-                  (nelisp-cfront-lower--collect-decl-types body nil)))
+                  (nelisp-cfront-lower--collect-decl-types body nil)
+                  ;; globals are visible for type inference but shadowed by any
+                  ;; same-named param/local appended before them (Doc 06 Step B).
+                  (mapcar (lambda (g) (cons (car g) (plist-get (cdr g) :type)))
+                          nelisp-cfront-lower--globals)))
          ;; Locals needing a frame-alloc block: arrays / struct-by-value
          ;; (always) and address-taken scalars.  (Address-taken *params*
          ;; would need an entry spill; for now `&param' signals via --addr.)
@@ -1101,24 +1206,35 @@ Includes the `nelisp_cfront__zero' helper.  Globals/prototypes are
 skipped in the MVP (functions only)."
   (unless (eq (car ast) 'program)
     (nelisp-cfront-lower--err :not-a-program ast))
-  (let ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
-        (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
-        (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
-        (nelisp-cfront-lower--uses-float nil)
-        (funcs nil))
+  (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
+         (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
+         (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
+         ;; Read-only integer globals (Doc 06 Step B): collected once (needs
+         ;; `--structs' for element sizing), exposed to every function's type
+         ;; env, and emitted as `data-blob' rodata symbols below.
+         (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+         (nelisp-cfront-lower--uses-float nil)
+         (funcs nil))
     (dolist (top (cdr ast))
       (pcase (car top)
         ('func (push (nelisp-cfront-lower--func top) funcs))
         ('proto nil)                          ; ignore prototypes
-        ('global nil)                         ; MVP: globals deferred
+        ('global nil)                         ; data emitted from --globals below
         ('struct-def nil)                     ; layout already in the table
         ('typedef nil)                        ; aliases resolved during parse
         (_ (nelisp-cfront-lower--err :unsupported-toplevel top))))
     (cons 'seq
-          (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)
-                (append (when nelisp-cfront-lower--uses-float
-                          (nelisp-cfront-float-helper-defuns))
-                        (nreverse funcs))))))
+          (append
+           ;; rodata data symbols first, then the zero helper, float helpers,
+           ;; and the lowered functions.
+           (mapcar (lambda (g)
+                     `(data-blob ,(intern (car g))
+                                 ,(plist-get (cdr g) :bytes) rodata))
+                   nelisp-cfront-lower--globals)
+           (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)
+                 (append (when nelisp-cfront-lower--uses-float
+                           (nelisp-cfront-float-helper-defuns))
+                         (nreverse funcs)))))))
 
 (provide 'nelisp-cfront-lower)
 

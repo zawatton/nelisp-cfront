@@ -47,10 +47,11 @@
          (buckets (make-hash-table :test 'eq))   ; reason -> count
          (examples (make-hash-table :test 'eq)))  ; reason -> first fn name
     ;; Replicate `lower-program's whole-program context.
-    (let ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
-          (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
-          (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
-          (nelisp-cfront-lower--uses-float nil))
+    (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
+           (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
+           (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
+           (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+           (nelisp-cfront-lower--uses-float nil))
       (dolist (top funcs)
         (condition-case e
             (progn (nelisp-cfront-lower--func top) (setq ok (1+ ok)))

@@ -84,14 +84,35 @@ Verified end-to-end (=nelisp-aot-compiler/data-blob-*= ERT tests): a blob
 C driver links and reads the exact bytes back
 (=getb(0)=10 getb(4)=250 getb(7)=200 getword(0)=0x281e140a=).
 
-** Step B — cfront: read-only integer global arrays (the =:deref= bucket)
-- Parser: retain global array initializer values (const-fold the
-  =init-list= elements to integers).
-- =--globals= registry: NAME → (type, optional const bytes).
-- Add globals to =tenv= so =type-of= resolves them (fixes the *type*
-  half: =sizeof(G)=, =G[i]= element type).
-- Emit each used const global as a =data-blob=; lower =G[i]= /=*p= to a
-  load at =(+ (data-addr-local "G") (* i elemsize))=.
+** Step B — cfront: read-only integer global arrays (the =:deref= bucket)  [DONE 2026-06-24]
+Implemented in cfront:
+- *Parser* (=nelisp-cfront-parse=): a global declarator now *retains its
+  array dimensions* on the type (mirrors local decls via =--fold-dim=),
+  instead of parsing and discarding the =[N]= dims.  This was the root of
+  the *type half* of =:deref-non-pointer=: a global array typed as a bare
+  scalar =long=, so =G[i]= derefed a non-pointer.
+- =nelisp-cfront-lower--globals= registry: NAME → (=:type= TY =:bytes=
+  UNIBYTE) built by =--collect-globals=, packing const integer
+  scalars/arrays little-endian (=--global-bytes= / =--pack-int=); handles
+  =int-list= initializers, =char[]= string initializers, and zero-pads to
+  the declared dimension.  Non-const / non-integer / struct / pointer
+  globals are skipped (left for Step C).
+- Globals are appended to each function's =tenv= (shadowed by same-named
+  params/locals via =--local-names=) so =type-of= resolves =G=, =G[i]=
+  element type, etc.
+- =lower-program= emits each collected global as a =(data-blob NAME BYTES
+  rodata)=; a global reference lowers through =(data-addr NAME)= — a
+  scalar loads (width + sign-extend), an array/struct decays to the
+  address (reusing =--rvalue= / =--addr=).  No =data-addr-local= op was
+  needed (Step A reuses =data-addr= against the local blob symbol).
+- =lower-gap-probe= also binds =--globals= so the metric reflects it.
+
+Verified: ERT =nelisp-cfront-global-*= (collect/bytes unit + data-addr
+lowering shape + cc-linked e2e reading unsigned/signed char arrays, an int
+array, an int scalar, and a loop summing a global array).  =lower-gap= on
+real =sqlite3.pp.c=: =:deref-non-pointer= 110 → 68, overall coverage 75.2%
+→ 76.5% (1798 → 1829 / 2392).  Remaining global =:deref= cases need Step C
+(struct-member-of-global, pointer globals, non-const array dims).
 
 ** Step C — general globals (.data read/write, struct/scalar globals)
 - =:unknown-struct= globals (=sqlite3Stat.nowValue[op]=): emit the global

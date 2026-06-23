@@ -801,11 +801,20 @@ Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
                            (list 'proto ty name params))
                   (list 'func ty name params (nelisp-cfront-parse--parse-block)))))
           ;; global variable (array dims + initializer + comma declarators)
-          (let ((init nil))
+          (let ((init nil) (gty ty))
+            ;; Retain array dimensions on the type (Doc 06 Step B) so a global
+            ;; array indexes/derefs correctly instead of defaulting to a scalar
+            ;; `long' (which produced `:deref-non-pointer').  `gty' is a fresh
+            ;; copy so the comma-declarator discard loop below still sees the
+            ;; base type.
             (while (nelisp-cfront-parse--at-punct "[")
               (nelisp-cfront-parse--advance)
-              (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
-              (nelisp-cfront-parse--eat-punct "]"))
+              (let ((sz (if (nelisp-cfront-parse--at-punct "]")
+                            t
+                          (nelisp-cfront-parse--fold-dim
+                           (nelisp-cfront-parse--parse-expr)))))
+                (nelisp-cfront-parse--eat-punct "]")
+                (setq gty (append gty (list :array sz)))))
             (when (nelisp-cfront-parse--at-punct "=")
               (nelisp-cfront-parse--advance)
               (setq init (nelisp-cfront-parse--parse-initializer)))
@@ -824,7 +833,7 @@ Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
                 (nelisp-cfront-parse--advance)
                 (nelisp-cfront-parse--parse-initializer)))
             (nelisp-cfront-parse--eat-punct ";")
-            (list 'global ty name init)))))))))
+            (list 'global gty name init)))))))))
 
 (defun nelisp-cfront-parse--parse-params ()
   (let ((params nil))
