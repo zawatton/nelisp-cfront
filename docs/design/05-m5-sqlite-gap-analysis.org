@@ -236,3 +236,57 @@ remaining float gap is the *external* SysV =double= ABI (xmm0 returns/
 args for non-cfront callers) — a thin =extern-call-f64= + =f64-bits=
 shim, deferred until an external double boundary actually needs it.
 
+* §9 Aggregate locals & address-of-local — DONE (upstream `frame-alloc')
+
+** §9.1 Upstream keystone
+
+nelisp-cc had no way to address frame memory (struct-by-value locals and
+=&local= were blocked).  Added =(frame-alloc NBYTES)= (opcode 101): it
+reserves =ceil(NBYTES/8)= slots from the defun's frame pool (same counter
+as =let-rt=, so the prologue's =sub rsp= covers it) and returns the
+block's lowest address via =mov rax, rbp; sub rax, K= (imm32, so large
+blocks bypass the disp8 slot range).  Stable across re-eval (slots fixed
+at parse) = a C local, not a dynamic =alloca=.  x86_64 SysV only.
+
+** §9.2 cfront memory-backed locals
+
+A local is *memory-backed* when its type is an array / struct-by-value,
+or its address is taken (=&x=, found by a full-tree walk of the body).
+=lower.el= binds such a local's slot to =(frame-alloc SIZE)= (the slot
+holds the block *address*); then:
+- an aggregate var *decays* to that address (so =a[i]=, =&a=, =s.f= work);
+- an address-taken scalar is read / written / =&='d *through* the
+  pointer (load / store / the address itself);
+- =&lvalue= generalised: =&x= / =&a[i]= / =&s.f= / =&*p= all lower to the
+  computed address with no value load.
+
+Supporting fixes: =type-elem= (array indexing element type — arrays decay,
+=type-pointee= only handled pointers); array dimensions are now
+constant-folded by the parser (=--fold-dim=, tolerant: VLA / =sizeof=
+(struct) fall back to an unknown =t= dimension so parsing never stalls;
+scalar/pointer =sizeof= folds); fixed a latent =--strip-array= plist
+corruption bug exposed once array element sizes were actually computed.
+
+** §9.3 Status
+
+Verified end-to-end (=test/nelisp-cfront-aggregate-test.el=):
+=sumarr(4)=14= (=int a[8]= filled + summed in loops), =useaddr()=42=
+(=&x= passed to a mutator), =structlocal()=42= (=struct P p; p.a=..=),
+=addrscalar()=42= (=int *q=&y; *q=*q+37=).  Suite 59/59 green; =make gap=
+unchanged at 24756 (the dimension-folding is tolerant — no regression).
+
+Deferred follow-ons: address-taken *params* (need an entry register
+spill; =&param= currently signals), aggregate *initializers* (=int
+a[]={..}=, =struct P p={..}=), and struct copy-by-value assignment.
+
+** §9.4 Varargs (the other half of "alloca + varargs")
+
+=frame-alloc= is also the foundation for the varargs *register save area*,
+but full SysV variadic support is a *separate, larger* ABI effort:
+callee =va_start= must spill the incoming GP (rdi-r9) + XMM (xmm0-7)
+arg registers into a save area and build the 24-byte =va_list= struct
+(gp_offset / fp_offset / overflow_arg_area / reg_save_area); =va_arg=
+walks it per type class; the caller must set =AL= (vector-count) and
+pass the stack-arg tail.  Scoped as the next upstream milestone — the
+=frame-alloc= keystone landed here unblocks its save-area piece.
+

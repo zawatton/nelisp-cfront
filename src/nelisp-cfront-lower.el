@@ -64,6 +64,11 @@ program, used to coerce call arguments between int and double-bits.")
 (defvar nelisp-cfront-lower--ret-float nil
   "Non-nil when the current function returns a scalar float/double (so
 `return' coerces an integer operand to double-bits).")
+(defvar nelisp-cfront-lower--mem-vars nil
+  "Alist NAME->type of memory-backed locals in the current function — C
+arrays, struct-by-value, and address-taken scalars.  Such a variable's
+grammar slot holds the *address* of a `frame-alloc' block; an aggregate
+decays to that address, a scalar is read/written through it.")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
@@ -101,6 +106,39 @@ names stay literal — the linker needs the original C symbol.)"
   "Non-nil when NAME denotes a function (not shadowed by a local/param)."
   (and (not (assoc name nelisp-cfront-lower--tenv))
        (assoc name nelisp-cfront-lower--funcs)))
+
+;;; --- memory-backed locals (frame-alloc: arrays / structs / &x) -------
+
+(defun nelisp-cfront-lower--aggregate-type-p (ty)
+  "Non-nil when TY is an aggregate stored by value: a C array, or a
+struct/union value (base struct, no pointer)."
+  (and ty
+       (or (plist-get ty :array)
+           (and (eq (plist-get ty :base) 'struct)
+                (= 0 (or (plist-get ty :ptr) 0))))))
+
+(defun nelisp-cfront-lower--mem-var (name)
+  "Return (NAME . TYPE) when NAME is a memory-backed local, else nil."
+  (assoc name nelisp-cfront-lower--mem-vars))
+
+(defun nelisp-cfront-lower--mem-var-scalar-p (name)
+  "Non-nil when memory-backed NAME is a scalar (read/written through the
+pointer) rather than an aggregate (which decays to the address)."
+  (let ((mv (nelisp-cfront-lower--mem-var name)))
+    (and mv (not (nelisp-cfront-lower--aggregate-type-p (cdr mv))))))
+
+(defun nelisp-cfront-lower--collect-addr-taken (node acc)
+  "Collect names appearing as `&NAME' (scalar address-of) anywhere in the
+NODE cons tree into ACC (a full car/cdr walk, so arg lists are covered)."
+  (cond
+   ((and (consp node) (eq (car node) 'unop) (equal (nth 1 node) "&")
+         (consp (nth 2 node)) (eq (car (nth 2 node)) 'var))
+    (push (nth 1 (nth 2 node)) acc)
+    (nelisp-cfront-lower--collect-addr-taken (nth 2 node) acc))
+   ((consp node)
+    (setq acc (nelisp-cfront-lower--collect-addr-taken (car node) acc))
+    (nelisp-cfront-lower--collect-addr-taken (cdr node) acc))
+   (t acc)))
 
 ;;; --- soft-float conversions (double carried as i64 bits) ------------
 
@@ -175,12 +213,15 @@ FROM-FLOAT-P / TO-FLOAT-P flags."
 (defun nelisp-cfront-lower--elem-size (ptr-expr)
   "Element size of the pointee/array element of PTR-EXPR's type."
   (nelisp-cfront-type-size
-   (nelisp-cfront-type-pointee (nelisp-cfront-lower--type-of ptr-expr))
+   (nelisp-cfront-type-elem (nelisp-cfront-lower--type-of ptr-expr))
    nelisp-cfront-lower--structs))
 
 (defun nelisp-cfront-lower--addr (e)
-  "Grammar address of lvalue E (deref / index / arrow / member)."
+  "Grammar address of lvalue E (deref / index / arrow / member / var)."
   (pcase (car e)
+    ('var (if (nelisp-cfront-lower--mem-var (nth 1 e))
+              (nelisp-cfront-lower--lvar (nth 1 e))   ; frame-alloc block address
+            (nelisp-cfront-lower--err :addr-of-non-memory-var e)))
     ('unop (if (string= (nth 1 e) "*")
                (nelisp-cfront-lower--expr (nth 2 e))
              (nelisp-cfront-lower--err :not-an-lvalue e)))
@@ -308,9 +349,18 @@ so positions stay aligned to call arguments."
   (pcase (car e)
     ('int (nth 1 e))
     ('var (let ((name (nth 1 e)))
-            (if (nelisp-cfront-lower--var-is-function-p name)
-                `(addr-of ,(nelisp-cfront-lower--sym name)) ; function -> pointer
-              (nelisp-cfront-lower--lvar name))))
+            (cond
+             ((nelisp-cfront-lower--var-is-function-p name)
+              `(addr-of ,(nelisp-cfront-lower--sym name)))   ; function -> pointer
+             ((nelisp-cfront-lower--mem-var-scalar-p name)
+              ;; address-taken scalar: read through the frame-alloc pointer
+              (nelisp-cfront-lower--load-w
+               (nelisp-cfront-lower--lvar name)
+               (nelisp-cfront-type-size (cdr (nelisp-cfront-lower--mem-var name))
+                                        nelisp-cfront-lower--structs)))
+             ;; aggregate local decays to its block address (= the slot value);
+             ;; plain scalar reads its value slot directly.
+             (t (nelisp-cfront-lower--lvar name)))))
     ('str (nelisp-cfront-lower--err :string-literal-unsupported e)) ; needs rodata
     ('binop (nelisp-cfront-lower--binop (nth 1 e) (nth 2 e) (nth 3 e)))
     ('unop (if (string= (nth 1 e) "*")
@@ -403,8 +453,10 @@ matches C, so the raw value is used directly."
       ("*" `(ptr-read-u64 ,g 0))              ; MVP: 8-byte deref
       ("&" (if (and (consp e) (eq (car e) 'var)
                     (nelisp-cfront-lower--var-is-function-p (nth 1 e)))
-               `(addr-of ,(nelisp-cfront-lower--sym (nth 1 e)))
-             (nelisp-cfront-lower--err :addr-of-unsupported e))) ; &local: M4 follow-on
+               `(addr-of ,(nelisp-cfront-lower--sym (nth 1 e)))  ; &function
+             ;; &lvalue: address of a memory-backed var / index / member /
+             ;; arrow / deref (computed without loading the value).
+             (nelisp-cfront-lower--addr e)))
       (_ (nelisp-cfront-lower--err :unsupported-unop op)))))
 
 (defun nelisp-cfront-lower--float-arith-helper (bop)
@@ -421,8 +473,10 @@ matches C, so the raw value is used directly."
                 (nelisp-cfront-lower--expr rhs)
                 (nelisp-cfront-lower--expr-float-p rhs)
                 lhs-float)))
-    (pcase (car lhs)
-      ('var
+    (cond
+     ;; plain value-slot scalar (NOT an address-taken / memory-backed var)
+     ((and (eq (car lhs) 'var)
+           (not (nelisp-cfront-lower--mem-var-scalar-p (nth 1 lhs))))
        (let ((name (nelisp-cfront-lower--lvar (nth 1 lhs))))
          (if (string= op "=")
              `(setq ,name ,grhs)
@@ -436,7 +490,8 @@ matches C, so the raw value is used directly."
                (let ((g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
                  (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
                  `(setq ,name (,g ,name ,(nelisp-cfront-lower--expr rhs)))))))))
-      ((or 'unop 'index 'arrow 'member)        ; memory lvalue: *p / a[i] / p->f / s.f
+      ;; memory lvalue: *p / a[i] / p->f / s.f / address-taken scalar var
+      ((memq (car lhs) '(var unop index arrow member))
        (let ((fld (nelisp-cfront-lower--field-of lhs)))
          (if (and fld (plist-get fld :bits))
              (nelisp-cfront-lower--bitfield-assign lhs op grhs fld)
@@ -458,7 +513,7 @@ matches C, so the raw value is used directly."
                      (nelisp-cfront-lower--store-w
                       addr width (list g (nelisp-cfront-lower--load-w addr width)
                                        (nelisp-cfront-lower--expr rhs)))))))))))
-      (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
+      (t (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
 (defun nelisp-cfront-lower--call-args (args ptypes)
   "Lower call ARGS, coercing each to its positional param type in PTYPES
@@ -496,9 +551,18 @@ in this MVP)."
   (let ((target (nth 2 e)) (op (nth 1 e)))
     (unless (eq (car target) 'var)
       (nelisp-cfront-lower--err :incdec-needs-var target))
-    (let ((name (nelisp-cfront-lower--lvar (nth 1 target)))
+    (let ((cname (nth 1 target))
           (delta (if (string= op "++") 1 -1)))
-      `(setq ,name (+ ,name ,delta)))))
+      (if (nelisp-cfront-lower--mem-var-scalar-p cname)
+          ;; address-taken scalar: load / +delta / store through the pointer
+          (let ((addr (nelisp-cfront-lower--lvar cname))
+                (width (nelisp-cfront-type-size
+                        (cdr (nelisp-cfront-lower--mem-var cname))
+                        nelisp-cfront-lower--structs)))
+            (nelisp-cfront-lower--store-w
+             addr width `(+ ,(nelisp-cfront-lower--load-w addr width) ,delta)))
+        (let ((name (nelisp-cfront-lower--lvar cname)))
+          `(setq ,name (+ ,name ,delta)))))))
 
 (defun nelisp-cfront-lower--sizeof (ty)
   (let ((ptr (plist-get ty :ptr)))
@@ -667,14 +731,26 @@ Only a single top-level forward label (the cleanup pattern) is supported."
 (defun nelisp-cfront-lower--effect (s)
   "Lower statement S in effect (value-discarded) position."
   (pcase (car s)
-    ('decl (let ((init (nth 3 s)))
-             (if (and init (not (and (consp init) (eq (car init) 'init-list))))
-                 `(setq ,(nelisp-cfront-lower--lvar (nth 2 s))
-                        ,(nelisp-cfront-lower--coerce       ; int<->double bits to match the decl type
+    ('decl (let ((init (nth 3 s)) (cname (nth 2 s)) (ty (nth 1 s)))
+             (cond
+              ;; uninitialised, or aggregate init (local array/struct deferred)
+              ((or (null init) (and (consp init) (eq (car init) 'init-list))) 0)
+              ;; address-taken scalar: store the initializer through the
+              ;; frame-alloc block pointer (the slot holds the address).
+              ((nelisp-cfront-lower--mem-var-scalar-p cname)
+               (nelisp-cfront-lower--store-w
+                (nelisp-cfront-lower--lvar cname)
+                (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)
+                (nelisp-cfront-lower--coerce
+                 (nelisp-cfront-lower--expr init)
+                 (nelisp-cfront-lower--expr-float-p init)
+                 (nelisp-cfront-float-type-p ty))))
+              ;; plain value-slot scalar
+              (t `(setq ,(nelisp-cfront-lower--lvar cname)
+                        ,(nelisp-cfront-lower--coerce  ; int<->double bits to match decl
                           (nelisp-cfront-lower--expr init)
                           (nelisp-cfront-lower--expr-float-p init)
-                          (nelisp-cfront-float-type-p (nth 1 s))))
-               0)))    ; uninitialised, or aggregate init (local array/struct deferred)
+                          (nelisp-cfront-float-type-p ty)))))))
     ('decls (nelisp-cfront-lower--seq
              (mapcar #'nelisp-cfront-lower--effect (cdr s))))
     ('expr-stmt (nelisp-cfront-lower--expr (nth 1 s)))
@@ -835,6 +911,18 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
           (append (delq nil (mapcar (lambda (p) (and (nth 2 p) (cons (nth 2 p) (nth 1 p))))
                                     params))
                   (nelisp-cfront-lower--collect-decl-types body nil)))
+         ;; Locals needing a frame-alloc block: arrays / struct-by-value
+         ;; (always) and address-taken scalars.  (Address-taken *params*
+         ;; would need an entry spill; for now `&param' signals via --addr.)
+         (addr-taken (nelisp-cfront-lower--collect-addr-taken body nil))
+         (nelisp-cfront-lower--mem-vars
+          (delq nil (mapcar
+                     (lambda (v)
+                       (let ((ty (cdr (assoc v nelisp-cfront-lower--tenv))))
+                         (when (and ty (or (nelisp-cfront-lower--aggregate-type-p ty)
+                                           (member v addr-taken)))
+                           (cons v ty))))
+                     locals)))
          (nelisp-cfront-lower--synth nil)
          (nelisp-cfront-lower--brk-stack nil)
          (nelisp-cfront-lower--brk-counter 0)
@@ -856,10 +944,17 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                                 (nelisp-cfront-lower--effect body))
                               'nlcf_retval)))
                    (nelisp-cfront-lower--block-tail body void-p)))
-         (local-binds (mapcar (lambda (v)
-                                (list (nelisp-cfront-lower--lvar v)
-                                      (list nelisp-cfront-lower--zero-fn)))
-                              locals))
+         (local-binds (mapcar
+                       (lambda (v)
+                         (let ((mv (assoc v nelisp-cfront-lower--mem-vars)))
+                           (list (nelisp-cfront-lower--lvar v)
+                                 (if mv
+                                     ;; memory-backed: slot holds a frame block address
+                                     (list 'frame-alloc
+                                           (nelisp-cfront-type-size
+                                            (cdr mv) nelisp-cfront-lower--structs))
+                                   (list nelisp-cfront-lower--zero-fn)))))
+                       locals))
          (synth-binds (mapcar (lambda (v) (list v (list nelisp-cfront-lower--zero-fn)))
                               (reverse nelisp-cfront-lower--synth)))
          (binds (append local-binds synth-binds))

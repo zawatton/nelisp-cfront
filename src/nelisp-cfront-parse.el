@@ -64,6 +64,15 @@ Enum-constant references are already folded to `(int N)' by
   (pcase (car e)
     ('int (nth 1 e))
     ('cast (nelisp-cfront-parse--const-eval (nth 2 e)))   ; integer cast (value-preserving)
+    ('sizeof                                              ; sizeof(TYPE): scalar/pointer only
+     (let* ((ty (nth 1 e)) (ptr (or (plist-get ty :ptr) 0)))
+       (if (> ptr 0) 8
+         (pcase (plist-get ty :base)
+           ('char 1) ('short 2) ('int 4) ('long 8) ('void 1)
+           ('float 4) ('double 8)
+           ;; struct/array sizeof needs the layout table (unavailable here);
+           ;; let the caller's tolerant fallback handle it.
+           (_ (signal 'nelisp-cfront-parse-error (list :non-const-sizeof ty)))))))
     ('unop (let ((v (nelisp-cfront-parse--const-eval (nth 2 e))))
              (pcase (nth 1 e)
                ("-" (- v)) ("+" v) ("~" (lognot v)) ("!" (if (= v 0) 1 0))
@@ -86,6 +95,14 @@ Enum-constant references are already folded to `(int N)' by
          ("||" (if (or (/= a 0) (/= b 0)) 1 0))
          (_ (signal 'nelisp-cfront-parse-error (list :non-const-binop e))))))
     (_ (signal 'nelisp-cfront-parse-error (list :non-const-expr e)))))
+
+(defun nelisp-cfront-parse--fold-dim (ast)
+  "Fold an already-parsed array-dimension AST to an integer size, or `t'
+when it is not a foldable compile-time constant (= VLA / sizeof(struct) /
+unknown).  The element type stays usable either way."
+  (condition-case nil
+      (nelisp-cfront-parse--const-eval ast)
+    (nelisp-cfront-parse-error t)))
 
 (defun nelisp-cfront-parse--parse-enum-body ()
   "Parse an enum `{ NAME [= CONST] , ... }' (point at `{'), registering
@@ -315,7 +332,7 @@ each constant into `--enum-consts' with C auto-increment semantics."
          ;; array field: TYPE NAME[N]
          ((nelisp-cfront-parse--at-punct "[")
           (nelisp-cfront-parse--advance)
-          (let ((sz (nelisp-cfront-parse--parse-expr)))
+          (let ((sz (nelisp-cfront-parse--fold-dim (nelisp-cfront-parse--parse-expr))))
             (nelisp-cfront-parse--eat-punct "]")
             (setq fty (append fty (list :array sz))))))
         (push (list 'field fty fname bits) fields)
@@ -337,7 +354,8 @@ each constant into `--enum-consts' with C auto-increment semantics."
                     (setq b2 (nth 1 (nelisp-cfront-parse--parse-expr))))
                    ((nelisp-cfront-parse--at-punct "[")
                     (nelisp-cfront-parse--advance)
-                    (let ((sz (nelisp-cfront-parse--parse-expr)))
+                    (let ((sz (nelisp-cfront-parse--fold-dim
+                               (nelisp-cfront-parse--parse-expr))))
                       (nelisp-cfront-parse--eat-punct "]")
                       (setq dty (append dty (list :array sz))))))
                   (push (list 'field dty nm b2) fields))))))
@@ -693,9 +711,12 @@ Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
           (setq name (nelisp-cfront-parse--eat-ident))
           (while (nelisp-cfront-parse--at-punct "[")   ; array dims
             (nelisp-cfront-parse--advance)
-            (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
-            (nelisp-cfront-parse--eat-punct "]")
-            (setq dty (append dty (list :array t)))))
+            (let ((sz (if (nelisp-cfront-parse--at-punct "]")
+                          t            ; incomplete dimension `[]' (pointer-like)
+                        (nelisp-cfront-parse--fold-dim
+                         (nelisp-cfront-parse--parse-expr)))))
+              (nelisp-cfront-parse--eat-punct "]")
+              (setq dty (append dty (list :array sz))))))
         (when (nelisp-cfront-parse--at-punct "=")
           (nelisp-cfront-parse--advance)
           (setq init (nelisp-cfront-parse--parse-initializer)))

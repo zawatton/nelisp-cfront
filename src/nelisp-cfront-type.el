@@ -62,16 +62,23 @@
      (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
 
 (defun nelisp-cfront-type--strip-array (ty)
+  "Return TY with its :array entries removed (= the array element type),
+preserving plist key/value order."
   (let ((out nil) (p ty))
     (while p
-      (unless (eq (car p) :array) (setq out (cons (car p) (cons (cadr p) out))))
+      (unless (eq (car p) :array)
+        (setq out (append out (list (car p) (cadr p)))))
       (setq p (cddr p)))
-    (nreverse out)))
+    out))
 
 (defun nelisp-cfront-type--const (expr)
-  "Evaluate a constant array-size EXPR (MVP: int literal only)."
-  (if (and (consp expr) (eq (car expr) 'int)) (nth 1 expr)
-    (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr))))
+  "Evaluate a constant array-size EXPR.
+Accepts a folded integer (from the parser's constant evaluator) or a
+legacy `(int N)' literal node."
+  (cond
+   ((integerp expr) expr)
+   ((and (consp expr) (eq (car expr) 'int)) (nth 1 expr))
+   (t (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr)))))
 
 (defun nelisp-cfront-type--round-up (n a) (* (/ (+ n a -1) a) a))
 
@@ -146,6 +153,14 @@ Also scans inline `:fields' on struct types in params/decls."
       (signal 'nelisp-cfront-type-error (list :deref-non-pointer ty)))
     (plist-put (copy-sequence ty) :ptr (1- ptr))))
 
+(defun nelisp-cfront-type-elem (ty)
+  "Element type of array TY, or pointee of pointer TY.
+A C array decays to a pointer, and indexing an array yields its element
+type (= TY with one array dimension removed)."
+  (if (plist-get ty :array)
+      (nelisp-cfront-type--strip-array ty)
+    (nelisp-cfront-type-pointee ty)))
+
 (defun nelisp-cfront-type-int () '(:base int :ptr 0))
 (defun nelisp-cfront-type-long () '(:base long :ptr 0))
 (defun nelisp-cfront-type-double () '(:base double :ptr 0))
@@ -173,7 +188,7 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
             (sname (plist-get oty :struct)))
        (plist-get (nelisp-cfront-type-field sname (nth 2 expr) structs) :type)))
     ('index
-     (nelisp-cfront-type-pointee
+     (nelisp-cfront-type-elem
       (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs)))
     ('unop
      (pcase (nth 1 expr)
