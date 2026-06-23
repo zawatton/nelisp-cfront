@@ -148,6 +148,12 @@ Also scans inline `:fields' on struct types in params/decls."
 
 (defun nelisp-cfront-type-int () '(:base int :ptr 0))
 (defun nelisp-cfront-type-long () '(:base long :ptr 0))
+(defun nelisp-cfront-type-double () '(:base double :ptr 0))
+
+(defun nelisp-cfront-type--float-p (ty)
+  "Non-nil when TY is a scalar (non-pointer) float/double."
+  (and (= 0 (or (plist-get ty :ptr) 0))
+       (memq (plist-get ty :base) '(float double))))
 
 ;;; --- expression type inference --------------------------------------
 
@@ -175,17 +181,28 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
              (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
        ("&" (let ((it (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
               (plist-put (copy-sequence it) :ptr (1+ (or (plist-get it :ptr) 0)))))
+       ;; unary +/- preserve the operand type (so `-x' on a double stays
+       ;; double); `!'/`~' yield integers.
+       ((or "-" "+") (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
        (_ (nelisp-cfront-type-long))))
     ('call
      (let ((fn (nth 1 expr)))
        (or (and (eq (car fn) 'var) (cdr (assoc (nth 1 fn) funcs)))
            (nelisp-cfront-type-long))))
     ('binop
-     ;; pointer +/- integer keeps the pointer type; else numeric
-     (let ((lt (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs)))
-       (if (and (member (nth 1 expr) '("+" "-")) (> (or (plist-get lt :ptr) 0) 0))
-           lt
-         (nelisp-cfront-type-long))))
+     ;; pointer +/- integer keeps the pointer type; float arithmetic
+     ;; yields double; comparisons and integer arithmetic yield long.
+     (let* ((op (nth 1 expr))
+            (lt (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
+            (rt (nelisp-cfront-type-of (nth 3 expr) tenv structs funcs)))
+       (cond
+        ((and (member op '("+" "-")) (> (or (plist-get lt :ptr) 0) 0)) lt)
+        ((and (member op '("+" "-")) (> (or (plist-get rt :ptr) 0) 0)) rt)
+        ((and (member op '("+" "-" "*" "/"))
+              (or (nelisp-cfront-type--float-p lt)
+                  (nelisp-cfront-type--float-p rt)))
+         (nelisp-cfront-type-double))
+        (t (nelisp-cfront-type-long)))))
     ('assign (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('ternary (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('cast (nth 1 expr))                ; a cast yields the cast-to type

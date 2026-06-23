@@ -124,3 +124,79 @@ forms, then the *lowering* gaps (float arithmetic via f64 grammar ops,
 enum-constant registration, aggregate/array-local storage) and the Tier-3
 upstream items (varargs ABI, alloca).  Continue with =make gap=.
 
+* §6 Float lowering — SOLVED via "soft-float in the i64 world"
+
+** §6.1 The blocker: nelisp-cc's f64 grammar is flat-only
+
+Surveying the upstream f64 grammar (=f64-add/sub/mul/div=, =f64-lt/gt/le/ge=,
+=i64-to-f64=, =f64-to-i64-trunc=, =bits-to-f64=, =f64-call=, =extern-call-f64=)
+found it is MVP "flat-only", *not* enough for real C double code:
+
+- *Nested f64 rejected* — =--emit-f64-leaf-into= signals
+  =:nested-f64-binop-needs-doc-112=; an f64-binop operand must be a leaf
+  (=ref :class f64= / =bits-to-f64= / =i64-to-f64= / =f64-call=).  So
+  =(f64-add (f64-mul a b) c)= does not compile.
+- *No f64-class local* — =let-rt= bindings are always =:class gp=; there
+  is no double stack slot, store, or reload.
+- *No mixed params* — SysV defuns require a uniform param class, so
+  =double f(double, int)= cannot even be expressed.
+
+i.e. native f64 was the same kind of *upstream* dependency as varargs /
+alloca (needs Doc 112 xmm-spill), NOT a quick cfront-side gap.
+
+** §6.2 The fix: carry =double= as its i64 bit pattern
+
+A C =double=/=float= is represented as its raw IEEE-754 *64-bit pattern
+in a gp (i64) register/slot* — exactly the value class cfront already
+supports everywhere (frame slots, =setq=, calls, returns).  Each float op
+lowers to a flat per-object helper call:
+
+| C            | lowering                                    | result    |
+|--------------+---------------------------------------------+-----------|
+| =a + b=      | =(nelisp_cfront__dadd A-bits B-bits)=       | bits      |
+| =a < b=      | =(nelisp_cfront__dlt  A-bits B-bits)=       | i64 0/1   |
+| =a == b=     | =(nelisp_cfront__deq ..)= (= dle & dge)     | i64 0/1   |
+| =-a=         | =(logxor A-bits 0x8000…)= (sign-bit flip)   | bits      |
+| =(double)i=  | =(nelisp_cfront__i2d I)=                     | bits      |
+| =(long)d=    | =(nelisp_cfront__d2i D-bits)= (truncate)    | int       |
+| =3.14=       | i64 literal = IEEE-754 bits (frexp encoder) | bits      |
+
+Each helper is one *flat* f64 op wrapped in =bits-to-f64= / =f64-bits=,
+so nesting / locals / mixed params all "just work" — every double is an
+ordinary i64 the rest of the pipeline already handles.  No Doc 112,
+no xmm spill, no f64 =let= slots.
+
+** §6.3 The one upstream primitive: =f64-bits=
+
+The only missing piece was the inverse of =bits-to-f64=: a grammar op that
+takes an f64-class result and reinterprets its raw bits as a gp i64.
+Added =(f64-bits F64-EXPR)= (opcode 100) to =nelisp-aot-compiler.el= —
+emits the f64 expr into xmm0 (binop or leaf) then =MOVQ rax, xmm0= (the
+asm primitive =movq-r64-xmm= already existed).  Both x86_64 + aarch64
+wired; 2 byte-level tests added; upstream f64 + aot suites stay green
+(125/125 + 169/169).
+
+** §6.4 Status: working end-to-end
+
+=test/nelisp-cfront-float-test.el= compiles real float C through the full
+pipeline (lex→parse→lower→AOT→.o), links, runs, asserts:
+
+#+begin_example
+poly(3.0)=29.5  mix(5)=10  cmp(1,2)=-1  cmp(2,2)=0  trunc1(3.9)=3  neg(2.5)=-2.5
+#+end_example
+
+covering nested arithmetic, double locals/params, int↔double conversion,
+compound =+==, comparisons, unary minus.  A separate manual probe also
+verifies double *struct fields* (=p->x*p->x + p->y*p->y= = 25.0) — the
+SQLite =Mem.r= pattern.  cfront suite 54/54 green.
+
+*ABI note*: a =double=-returning cfront function returns the bits in rax
+(gp), not an xmm0 double.  Internally consistent for cfront-compiled call
+graphs (= SQLite's own float math).  Interop with the external SysV
+=double= ABI (libm results, external callers) needs a thin
+=extern-call-f64= + =f64-bits= shim — a documented follow-on.
+
+*Remaining lowering gaps* (next, all cfront-side): enum-constant
+registration; aggregate/array-local storage (=alloca=, upstream);
+float call-arg coercion (needs param-type tracking in the funcs table).
+

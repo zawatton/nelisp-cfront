@@ -33,8 +33,13 @@
 (require 'cl-lib)
 (require 'nelisp-cfront-parse)
 (require 'nelisp-cfront-type)
+(require 'nelisp-cfront-float)
 
 (define-error 'nelisp-cfront-lower-error "nelisp-cfront lowering error")
+
+(defvar nelisp-cfront-lower--uses-float nil
+  "Set non-nil during lowering when any float op needs the soft-float
+helpers; `lower-program' then prepends the helper defuns.")
 
 (defvar nelisp-cfront-lower--structs nil
   "Struct table (name->layout) for the program being lowered.")
@@ -53,6 +58,9 @@
 \(used for functions that `return' from inside a loop).")
 (defvar nelisp-cfront-lower--goto-flag nil
   "Goto flag symbol when the function uses `goto' (single forward label).")
+(defvar nelisp-cfront-lower--ret-float nil
+  "Non-nil when the current function returns a scalar float/double (so
+`return' coerces an integer operand to double-bits).")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
@@ -90,6 +98,51 @@ names stay literal — the linker needs the original C symbol.)"
   "Non-nil when NAME denotes a function (not shadowed by a local/param)."
   (and (not (assoc name nelisp-cfront-lower--tenv))
        (assoc name nelisp-cfront-lower--funcs)))
+
+;;; --- soft-float conversions (double carried as i64 bits) ------------
+
+(defun nelisp-cfront-lower--expr-float-p (e)
+  "Non-nil when C expression E has scalar float/double type."
+  (nelisp-cfront-float-type-p (nelisp-cfront-lower--type-of e)))
+
+(defun nelisp-cfront-lower--mark-float ()
+  (setq nelisp-cfront-lower--uses-float t))
+
+(defun nelisp-cfront-lower--as-double-bits (e)
+  "Lower C expression E to grammar double-bits (i64), converting from int
+with the `i2d' helper when E is integer-typed."
+  (let ((g (nelisp-cfront-lower--expr e)))
+    (if (nelisp-cfront-lower--expr-float-p e)
+        g
+      (nelisp-cfront-lower--mark-float)
+      (list 'nelisp_cfront__i2d g))))
+
+(defun nelisp-cfront-lower--as-int (e)
+  "Lower C expression E to a grammar integer, converting from double-bits
+with the `d2i' helper (truncation) when E is float-typed."
+  (let ((g (nelisp-cfront-lower--expr e)))
+    (if (nelisp-cfront-lower--expr-float-p e)
+        (progn (nelisp-cfront-lower--mark-float)
+               (list 'nelisp_cfront__d2i g))
+      g)))
+
+(defun nelisp-cfront-lower--coerce (g from-float-p to-float-p)
+  "Coerce already-lowered grammar G between int and double-bits per the
+FROM-FLOAT-P / TO-FLOAT-P flags."
+  (cond
+   ((eq (not from-float-p) (not to-float-p)) g)   ; same class
+   (to-float-p (nelisp-cfront-lower--mark-float)
+               (list 'nelisp_cfront__i2d g))      ; int -> double bits
+   (t (nelisp-cfront-lower--mark-float)
+      (list 'nelisp_cfront__d2i g))))             ; double bits -> int
+
+(defun nelisp-cfront-lower--return-value (expr)
+  "Lower a `return' operand EXPR, coercing to the function's return class."
+  (if (null expr) 0
+    (nelisp-cfront-lower--coerce
+     (nelisp-cfront-lower--expr expr)
+     (nelisp-cfront-lower--expr-float-p expr)
+     nelisp-cfront-lower--ret-float)))
 
 (defun nelisp-cfront-lower--load-w (addr width)
   "Load WIDTH bytes from grammar address ADDR (offset folded into ADDR)."
@@ -251,9 +304,13 @@ arrow/member lvalue E, or nil."
     ('sizeof (nelisp-cfront-lower--sizeof (nth 1 e)))
     ('sizeof-expr (nelisp-cfront-type-size (nelisp-cfront-lower--type-of (nth 1 e))
                                            nelisp-cfront-lower--structs))
-    ('cast (nelisp-cfront-lower--expr (nth 2 e)))   ; untyped i64: cast is identity
+    ('cast (nelisp-cfront-lower--coerce             ; int<->double conversion; else identity
+            (nelisp-cfront-lower--expr (nth 2 e))
+            (nelisp-cfront-lower--expr-float-p (nth 2 e))
+            (nelisp-cfront-float-type-p (nth 1 e))))
     ('va-arg (nelisp-cfront-lower--err :varargs-unsupported e))  ; Tier 3 / upstream
-    ('fnum (nelisp-cfront-lower--err :float-lowering-pending e))  ; needs f64 grammar lower
+    ('fnum (progn (nelisp-cfront-lower--mark-float)               ; double carried as i64 bits
+                  (nelisp-cfront-float--double-to-bits (nth 1 e))))
     ('comma (nelisp-cfront-lower--seq (list (nelisp-cfront-lower--expr (nth 1 e))
                                             (nelisp-cfront-lower--expr (nth 2 e)))))
     ((or 'pre 'post) (nelisp-cfront-lower--incdec e))
@@ -261,24 +318,47 @@ arrow/member lvalue E, or nil."
     (_ (nelisp-cfront-lower--err :unsupported-expr e))))
 
 (defun nelisp-cfront-lower--binop (op l r)
-  (let ((gl (nelisp-cfront-lower--expr l))
-        (gr (nelisp-cfront-lower--expr r))
-        (g (cdr (assoc op nelisp-cfront-lower--binop-map))))
-    (cond
-     ;; pointer +/- integer: scale the integer by the pointee size
-     ((and (member op '("+" "-"))
-           (> (or (plist-get (nelisp-cfront-lower--type-of l) :ptr) 0) 0)
-           (= 0 (or (plist-get (nelisp-cfront-lower--type-of r) :ptr) 0)))
-      (let ((es (nelisp-cfront-lower--elem-size l)))
-        (list (cdr (assoc op nelisp-cfront-lower--binop-map))
-              gl (if (= es 1) gr `(* ,gr ,es)))))
-     (g (list g gl gr))
-     ((string= op "!=") `(if (= ,gl ,gr) 0 1))
-     ((string= op "&&") `(if ,(nelisp-cfront-lower--truth gl)
-                             ,(nelisp-cfront-lower--truth gr) 0))
-     ((string= op "||") `(if ,(nelisp-cfront-lower--truth gl) 1
-                           ,(nelisp-cfront-lower--truth gr)))
-     (t (nelisp-cfront-lower--err :unsupported-binop op)))))
+  ;; --- floating-point arithmetic / comparison (soft-float helpers) ---
+  ;; When either operand is float-typed and OP is arithmetic or a
+  ;; comparison, both operands are coerced to double-bits and the op
+  ;; lowers to a per-object helper call (arithmetic -> bits, comparison
+  ;; -> i64 0/1).  `%' on doubles is a C type error and never appears.
+  (if (and (or (nelisp-cfront-lower--expr-float-p l)
+               (nelisp-cfront-lower--expr-float-p r))
+           (member op '("+" "-" "*" "/" "<" "<=" ">" ">=" "==" "!=")))
+      (let ((a (nelisp-cfront-lower--as-double-bits l))
+            (b (nelisp-cfront-lower--as-double-bits r)))
+        (nelisp-cfront-lower--mark-float)
+        (pcase op
+          ("+"  (list 'nelisp_cfront__dadd a b))
+          ("-"  (list 'nelisp_cfront__dsub a b))
+          ("*"  (list 'nelisp_cfront__dmul a b))
+          ("/"  (list 'nelisp_cfront__ddiv a b))
+          ("<"  (list 'nelisp_cfront__dlt a b))
+          (">"  (list 'nelisp_cfront__dgt a b))
+          ("<=" (list 'nelisp_cfront__dle a b))
+          (">=" (list 'nelisp_cfront__dge a b))
+          ("==" (list 'nelisp_cfront__deq a b))
+          ("!=" `(if ,(list 'nelisp_cfront__deq a b) 0 1))))
+    ;; --- integer / pointer path ---
+    (let ((gl (nelisp-cfront-lower--expr l))
+          (gr (nelisp-cfront-lower--expr r))
+          (g (cdr (assoc op nelisp-cfront-lower--binop-map))))
+      (cond
+       ;; pointer +/- integer: scale the integer by the pointee size
+       ((and (member op '("+" "-"))
+             (> (or (plist-get (nelisp-cfront-lower--type-of l) :ptr) 0) 0)
+             (= 0 (or (plist-get (nelisp-cfront-lower--type-of r) :ptr) 0)))
+        (let ((es (nelisp-cfront-lower--elem-size l)))
+          (list (cdr (assoc op nelisp-cfront-lower--binop-map))
+                gl (if (= es 1) gr `(* ,gr ,es)))))
+       (g (list g gl gr))
+       ((string= op "!=") `(if (= ,gl ,gr) 0 1))
+       ((string= op "&&") `(if ,(nelisp-cfront-lower--truth gl)
+                               ,(nelisp-cfront-lower--truth gr) 0))
+       ((string= op "||") `(if ,(nelisp-cfront-lower--truth gl) 1
+                             ,(nelisp-cfront-lower--truth gr)))
+       (t (nelisp-cfront-lower--err :unsupported-binop op))))))
 
 (defun nelisp-cfront-lower--truth (g)
   "Normalise grammar value G to 0/1 (C truthiness, non-zero -> 1)."
@@ -292,7 +372,10 @@ matches C, so the raw value is used directly."
 (defun nelisp-cfront-lower--unop (op e)
   (let ((g (nelisp-cfront-lower--expr e)))
     (pcase op
-      ("-" `(- 0 ,g))
+      ;; float negation = flip the IEEE sign bit (no helper needed)
+      ("-" (if (nelisp-cfront-lower--expr-float-p e)
+               `(logxor ,g ,nelisp-cfront-float--sign-bit)
+             `(- 0 ,g)))
       ("+" g)
       ("!" `(if (= ,g 0) 1 0))
       ("~" `(logxor ,g -1))
@@ -303,18 +386,35 @@ matches C, so the raw value is used directly."
              (nelisp-cfront-lower--err :addr-of-unsupported e))) ; &local: M4 follow-on
       (_ (nelisp-cfront-lower--err :unsupported-unop op)))))
 
+(defun nelisp-cfront-lower--float-arith-helper (bop)
+  "Soft-float helper symbol for compound-assignment arithmetic BOP."
+  (pcase bop
+    ("+" 'nelisp_cfront__dadd) ("-" 'nelisp_cfront__dsub)
+    ("*" 'nelisp_cfront__dmul) ("/" 'nelisp_cfront__ddiv)
+    (_ nil)))
+
 (defun nelisp-cfront-lower--assign (op lhs rhs)
-  (let ((grhs (nelisp-cfront-lower--expr rhs)))
+  (let* ((lhs-float (nelisp-cfront-lower--expr-float-p lhs))
+         ;; RHS value coerced to the LHS class (int<->double bits) for `='
+         (grhs (nelisp-cfront-lower--coerce
+                (nelisp-cfront-lower--expr rhs)
+                (nelisp-cfront-lower--expr-float-p rhs)
+                lhs-float)))
     (pcase (car lhs)
       ('var
        (let ((name (nelisp-cfront-lower--lvar (nth 1 lhs))))
          (if (string= op "=")
              `(setq ,name ,grhs)
            ;; compound: a OP= b  ->  a = a OP b
-           (let* ((bop (substring op 0 (1- (length op))))
-                  (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
-             (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
-             `(setq ,name (,g ,name ,grhs))))))
+           (let ((bop (substring op 0 (1- (length op)))))
+             (if lhs-float
+                 (let ((h (nelisp-cfront-lower--float-arith-helper bop)))
+                   (unless h (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                   (nelisp-cfront-lower--mark-float)
+                   `(setq ,name (,h ,name ,(nelisp-cfront-lower--as-double-bits rhs))))
+               (let ((g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+                 (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                 `(setq ,name (,g ,name ,(nelisp-cfront-lower--expr rhs)))))))))
       ((or 'unop 'index 'arrow 'member)        ; memory lvalue: *p / a[i] / p->f / s.f
        (let ((fld (nelisp-cfront-lower--field-of lhs)))
          (if (and fld (plist-get fld :bits))
@@ -324,11 +424,19 @@ matches C, so the raw value is used directly."
                                                  nelisp-cfront-lower--structs)))
              (if (string= op "=")
                  (nelisp-cfront-lower--store-w addr width grhs)
-               (let* ((bop (substring op 0 (1- (length op))))
-                      (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
-                 (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
-                 (nelisp-cfront-lower--store-w
-                  addr width (list g (nelisp-cfront-lower--load-w addr width) grhs))))))))
+               (let ((bop (substring op 0 (1- (length op)))))
+                 (if lhs-float
+                     (let ((h (nelisp-cfront-lower--float-arith-helper bop)))
+                       (unless h (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                       (nelisp-cfront-lower--mark-float)
+                       (nelisp-cfront-lower--store-w
+                        addr width (list h (nelisp-cfront-lower--load-w addr width)
+                                         (nelisp-cfront-lower--as-double-bits rhs))))
+                   (let ((g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+                     (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                     (nelisp-cfront-lower--store-w
+                      addr width (list g (nelisp-cfront-lower--load-w addr width)
+                                       (nelisp-cfront-lower--expr rhs)))))))))))
       (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
 (defun nelisp-cfront-lower--call (fn args)
@@ -524,7 +632,10 @@ Only a single top-level forward label (the cleanup pattern) is supported."
     ('decl (let ((init (nth 3 s)))
              (if (and init (not (and (consp init) (eq (car init) 'init-list))))
                  `(setq ,(nelisp-cfront-lower--lvar (nth 2 s))
-                        ,(nelisp-cfront-lower--expr init))
+                        ,(nelisp-cfront-lower--coerce       ; int<->double bits to match the decl type
+                          (nelisp-cfront-lower--expr init)
+                          (nelisp-cfront-lower--expr-float-p init)
+                          (nelisp-cfront-float-type-p (nth 1 s))))
                0)))    ; uninitialised, or aggregate init (local array/struct deferred)
     ('decls (nelisp-cfront-lower--seq
              (mapcar #'nelisp-cfront-lower--effect (cdr s))))
@@ -549,7 +660,7 @@ Only a single top-level forward label (the cleanup pattern) is supported."
     ('return (if nelisp-cfront-lower--ret-mode
                  (let ((rs (car nelisp-cfront-lower--ret-mode))
                        (rv (cdr nelisp-cfront-lower--ret-mode)))
-                   `(seq (setq ,rv ,(if (nth 1 s) (nelisp-cfront-lower--expr (nth 1 s)) 0))
+                   `(seq (setq ,rv ,(nelisp-cfront-lower--return-value (nth 1 s)))
                          (setq ,rs 1)))
                (nelisp-cfront-lower--err :early-return-in-loop-unsupported s)))
     ('goto (if nelisp-cfront-lower--goto-flag
@@ -608,7 +719,7 @@ guards later cases; default runs when matched OR no case value matched."
 (defun nelisp-cfront-lower--tail (s void-p)
   "Lower statement S in tail (return-value) position."
   (pcase (car s)
-    ('return (if (nth 1 s) (nelisp-cfront-lower--expr (nth 1 s)) 0))
+    ('return (nelisp-cfront-lower--return-value (nth 1 s)))
     ('block (nelisp-cfront-lower--block-tail s void-p))
     ('if `(if ,(nelisp-cfront-lower--cond (nth 1 s))
               ,(nelisp-cfront-lower--tail (nth 2 s) void-p)
@@ -677,6 +788,7 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (params (nth 3 node))
          (body (nth 4 node))
          (void-p (and (eq (plist-get rty :base) 'void) (= 0 (plist-get rty :ptr))))
+         (nelisp-cfront-lower--ret-float (nelisp-cfront-float-type-p rty))
          (pnames (delq nil (mapcar (lambda (p) (and (nth 2 p)
                                                     (nelisp-cfront-lower--lvar (nth 2 p))))
                                    params)))
@@ -724,6 +836,7 @@ skipped in the MVP (functions only)."
     (nelisp-cfront-lower--err :not-a-program ast))
   (let ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
         (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
+        (nelisp-cfront-lower--uses-float nil)
         (funcs nil))
     (dolist (top (cdr ast))
       (pcase (car top)
@@ -735,7 +848,9 @@ skipped in the MVP (functions only)."
         (_ (nelisp-cfront-lower--err :unsupported-toplevel top))))
     (cons 'seq
           (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)
-                (nreverse funcs)))))
+                (append (when nelisp-cfront-lower--uses-float
+                          (nelisp-cfront-float-helper-defuns))
+                        (nreverse funcs))))))
 
 (provide 'nelisp-cfront-lower)
 

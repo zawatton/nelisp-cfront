@@ -1,0 +1,117 @@
+;;; nelisp-cfront-float-test.el --- end-to-end soft-float -*- lexical-binding: t; -*-
+
+;; Copyright (C) 2026 zawatton
+
+;; This file is not part of GNU Emacs.
+
+;; SPDX-License-Identifier: GPL-3.0-or-later
+
+;;; Commentary:
+
+;; M5 float lowering — end-to-end ERT for the "soft-float in the i64
+;; world" scheme: a C `double' is carried as its IEEE-754 i64 bit
+;; pattern, so nested float expressions, double locals, mixed int/float
+;; operands, conversions, and comparisons all lower onto the gp-class
+;; machinery via per-object `nelisp_cfront__d*' helpers (which use the
+;; upstream `f64-bits' keystone op).
+;;
+;; The cfront `double' ABI returns/receives bits in rax (= gp), so the C
+;; driver passes/reads them as `long' + memcpy.  Skips (not fails) when
+;; the AOT backend or cc are unavailable.
+
+;;; Code:
+
+(require 'ert)
+(require 'nelisp-cfront-cc)
+(require 'nelisp-cfront-float)
+
+(defun nelisp-cfront-float-test--available-p ()
+  (and (require 'nelisp-aot-compiler nil t)
+       (fboundp 'nelisp-aot-compile-to-object)
+       (or (executable-find "cc") (executable-find "gcc"))))
+
+(defun nelisp-cfront-float-test--run (csource driver-c)
+  "Compile CSOURCE, link with DRIVER-C, run; return (cons EXIT STDOUT)."
+  (let* ((dir (make-temp-file "nlcf-float" t))
+         (obj (expand-file-name "prog.o" dir))
+         (cdrv (expand-file-name "drv.c" dir))
+         (bin (expand-file-name "prog" dir)))
+    (unwind-protect
+        (progn
+          (nelisp-cfront-compile-string csource obj)
+          (with-temp-file cdrv (insert driver-c))
+          (let ((cc (or (executable-find "cc") (executable-find "gcc"))))
+            (unless (zerop (call-process cc nil nil nil cdrv obj "-o" bin))
+              (error "float e2e: link failed"))
+            (with-temp-buffer
+              (let ((rc (call-process bin nil t nil)))
+                (cons rc (string-trim (buffer-string)))))))
+      (ignore-errors (delete-directory dir t)))))
+
+(defconst nelisp-cfront-float-test--driver "
+#include <stdio.h>
+#include <string.h>
+extern long poly(long);
+extern long mix(long);
+extern long cmp(long,long);
+extern long trunc1(long);
+extern long neg(long);
+static long B(double d){long x;memcpy(&x,&d,8);return x;}
+static double U(long x){double d;memcpy(&d,&x,8);return d;}
+int main(void){
+  double p = U(poly(B(3.0)));     /* 2*9 + 3.5*3 + 1 = 29.5 */
+  double m = U(mix(5));            /* 0+1+2+3+4 = 10.0 */
+  long c1 = cmp(B(1.0),B(2.0));    /* -1 */
+  long c2 = cmp(B(2.0),B(2.0));    /* 0  */
+  long t  = trunc1(B(3.9));        /* 3  */
+  double ng = U(neg(B(2.5)));      /* -2.5 */
+  printf(\"%g %g %ld %ld %ld %g\\n\", p, m, c1, c2, t, ng);
+  return (p==29.5 && m==10.0 && c1==-1 && c2==0 && t==3 && ng==-2.5)?0:1;
+}
+")
+
+(ert-deftest nelisp-cfront-float-soft-float-e2e ()
+  "Nested float arithmetic, double locals, int<->double conversion,
+compound assignment, comparisons, and unary minus — all native."
+  (unless (nelisp-cfront-float-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-float-test--run "
+double poly(double x){
+  double a = 2.0;
+  double b = 3.5;
+  return a*x*x + b*x + 1.0;
+}
+double mix(long n){
+  double s = 0.0;
+  for (long i = 0; i < n; i = i + 1) s += (double)i;
+  return s;
+}
+long cmp(double a, double b){
+  if (a < b) return -1;
+  if (a > b) return 1;
+  return 0;
+}
+long trunc1(double x){ return (long)x; }
+double neg(double x){ return -x; }
+"
+                                              nelisp-cfront-float-test--driver)))
+    (should (equal "29.5 10 -1 0 3 -2.5" (cdr res)))
+    (should (= 0 (car res)))))
+
+(ert-deftest nelisp-cfront-float-double-to-bits-exact ()
+  "The IEEE-754 encoder is bit-exact for representative literals."
+  (should (= (nelisp-cfront-float--double-to-bits 1.5)
+             #x3ff8000000000000))
+  (should (= (nelisp-cfront-float--double-to-bits 0.0) 0))
+  (should (= (nelisp-cfront-float--double-to-bits 42.0)
+             #x4045000000000000))
+  ;; 3.14 = 0x40091eb851eb851f, < 2^63 so it stays a positive i64
+  (should (= (nelisp-cfront-float--double-to-bits 3.14)
+             #x40091eb851eb851f))
+  ;; -1.0 = 0xbff0000000000000 (signed)
+  (should (= (nelisp-cfront-float--double-to-bits -1.0)
+             (- #xbff0000000000000 (ash 1 64)))))
+
+(provide 'nelisp-cfront-float-test)
+
+;;; nelisp-cfront-float-test.el ends here
