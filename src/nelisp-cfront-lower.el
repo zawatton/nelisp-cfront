@@ -51,6 +51,8 @@
 (defvar nelisp-cfront-lower--ret-mode nil
   "When non-nil, (RET-SET-SYM . RET-VAL-SYM) for single-exit return mode
 \(used for functions that `return' from inside a loop).")
+(defvar nelisp-cfront-lower--goto-flag nil
+  "Goto flag symbol when the function uses `goto' (single forward label).")
 
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
@@ -335,10 +337,24 @@ in this MVP)."
        0)))
 
 (defun nelisp-cfront-lower--active-exit-flags ()
-  "Exit flags in scope: innermost break flag + the return flag (if any)."
+  "Exit flags in scope: break + return + goto flags (whichever are active)."
   (delq nil (list (car nelisp-cfront-lower--brk-stack)
                   (and nelisp-cfront-lower--ret-mode
-                       (car nelisp-cfront-lower--ret-mode)))))
+                       (car nelisp-cfront-lower--ret-mode))
+                  nelisp-cfront-lower--goto-flag)))
+
+(defun nelisp-cfront-lower--has-goto-p (node)
+  "Non-nil when NODE contains a `goto' or a `label'."
+  (and (consp node)
+       (pcase (car node)
+         ((or 'goto 'label) t)
+         ('block (cl-some #'nelisp-cfront-lower--has-goto-p (cdr node)))
+         ('if (or (nelisp-cfront-lower--has-goto-p (nth 2 node))
+                  (nelisp-cfront-lower--has-goto-p (nth 3 node))))
+         ('while (nelisp-cfront-lower--has-goto-p (nth 2 node)))
+         ('for (or (nelisp-cfront-lower--has-goto-p (nth 1 node))
+                   (nelisp-cfront-lower--has-goto-p (nth 4 node))))
+         (_ nil))))
 
 (defun nelisp-cfront-lower--return-in-loop-p (node in-loop)
   "Non-nil when NODE contains a `return' lexically inside a loop."
@@ -358,7 +374,7 @@ in this MVP)."
   "Non-nil when S always exits the current iteration (break/continue/return)."
   (and (consp s)
        (pcase (car s)
-         ((or 'break 'continue 'return) t)
+         ((or 'break 'continue 'return 'goto) t)
          ('block (let ((ss (cdr s))) (and ss (nelisp-cfront-lower--exit-stmt-p (car (last ss))))))
          ('if (and (nth 3 s)
                    (nelisp-cfront-lower--exit-stmt-p (nth 2 s))
@@ -398,14 +414,32 @@ single-exit mode), so break/continue/return all exit correctly."
             (if flag (cons flag nelisp-cfront-lower--brk-stack)
               nelisp-cfront-lower--brk-stack))
            (b (nelisp-cfront-lower--effect body))
-           (flags (delq nil (list flag (and nelisp-cfront-lower--ret-mode
-                                            (car nelisp-cfront-lower--ret-mode)))))
+           (flags (delq nil (list flag
+                                  (and nelisp-cfront-lower--ret-mode
+                                       (car nelisp-cfront-lower--ret-mode))
+                                  nelisp-cfront-lower--goto-flag)))
            (acond (nelisp-cfront-lower--guard-clear
                    flags (nelisp-cfront-lower--cond cnd)))
            (st (and step (nelisp-cfront-lower--guard-clear
                           flags (nelisp-cfront-lower--expr step)))))
       `(while ,acond
          ,(nelisp-cfront-lower--seq (if st (list b st) (list b)))))))
+
+(defun nelisp-cfront-lower--lower-body-with-goto (body)
+  "Lower a function BODY that uses a forward `goto' to a top-level label.
+Splits the top-level block at the label: code before is guarded by the
+goto flag (so `goto' skips it); the label clears the flag; code after runs.
+Only a single top-level forward label (the cleanup pattern) is supported."
+  (let* ((stmts (cdr body))
+         (pos (cl-position-if (lambda (s) (eq (car s) 'label)) stmts)))
+    (if (null pos)
+        (nelisp-cfront-lower--effect body)
+      (let ((before (cl-subseq stmts 0 pos))
+            (after (cl-subseq stmts (1+ pos))))   ; drop the label marker itself
+        (nelisp-cfront-lower--seq
+         (list (nelisp-cfront-lower--stmts-effect before)
+               `(setq ,nelisp-cfront-lower--goto-flag 0)   ; the label: disarm
+               (nelisp-cfront-lower--stmts-effect after)))))))
 
 (defun nelisp-cfront-lower--effect (s)
   "Lower statement S in effect (value-discarded) position."
@@ -432,6 +466,12 @@ single-exit mode), so break/continue/return all exit correctly."
                    `(seq (setq ,rv ,(if (nth 1 s) (nelisp-cfront-lower--expr (nth 1 s)) 0))
                          (setq ,rs 1)))
                (nelisp-cfront-lower--err :early-return-in-loop-unsupported s)))
+    ('goto (if nelisp-cfront-lower--goto-flag
+               `(setq ,nelisp-cfront-lower--goto-flag 1) ; forward jump: arm the flag
+             (nelisp-cfront-lower--err :goto-unsupported s)))
+    ('label (if nelisp-cfront-lower--goto-flag
+                `(setq ,nelisp-cfront-lower--goto-flag 0) ; arrived: disarm the flag
+              0))
     (_ (nelisp-cfront-lower--err :unsupported-stmt s))))
 
 (defun nelisp-cfront-lower--for (s)
@@ -523,17 +563,23 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (nelisp-cfront-lower--synth nil)
          (nelisp-cfront-lower--brk-stack nil)
          (nelisp-cfront-lower--brk-counter 0)
-         (ril (nelisp-cfront-lower--return-in-loop-p body nil))
+         (has-goto (nelisp-cfront-lower--has-goto-p body))
+         (needs-exit (or (nelisp-cfront-lower--return-in-loop-p body nil) has-goto))
          (nelisp-cfront-lower--ret-mode
-          (and ril (cons 'nlcf_retset 'nlcf_retval)))
-         (body-g (if ril
+          (and needs-exit (cons 'nlcf_retset 'nlcf_retval)))
+         (nelisp-cfront-lower--goto-flag (and has-goto 'nlcf_goto))
+         (body-g (if needs-exit
                      ;; single-exit mode: run the whole body for effect
-                     ;; (returns set the flag), then yield the return value.
+                     ;; (returns/gotos set flags), then yield the return value.
                      (progn
                        (push 'nlcf_retset nelisp-cfront-lower--synth)
                        (push 'nlcf_retval nelisp-cfront-lower--synth)
+                       (when has-goto (push 'nlcf_goto nelisp-cfront-lower--synth))
                        (nelisp-cfront-lower--seq
-                        (list (nelisp-cfront-lower--effect body) 'nlcf_retval)))
+                        (list (if has-goto
+                                  (nelisp-cfront-lower--lower-body-with-goto body)
+                                (nelisp-cfront-lower--effect body))
+                              'nlcf_retval)))
                    (nelisp-cfront-lower--block-tail body void-p)))
          (local-binds (mapcar (lambda (v)
                                 (list (nelisp-cfront-lower--lvar v)
