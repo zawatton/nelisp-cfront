@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc help
+.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc gap help
 
 EMACS ?= emacs
 
@@ -78,6 +78,13 @@ cc:
 	$(EMACS) -Q --batch $(LOADPATH) \
 	  -l nelisp-cfront-cc \
 	  -f nelisp-cfront-cc-batch
+
+# Gap probe: report cfront's first parse gap on a preprocessed C file.
+#   gcc -E -P sqlite3.c > /tmp/sqlite3.pp.c ; make gap FILE=/tmp/sqlite3.pp.c
+gap:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l spike/gap-probe.el \
+	  --eval '(nelisp-cfront-gap-probe)'
 
 clean:
 	rm -f src/*.elc test/*.elc spike/*.elc

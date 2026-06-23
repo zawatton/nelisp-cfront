@@ -1,0 +1,81 @@
+#+TITLE: Doc 05 — M5 SQLite gap analysis (data-driven)
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-23
+#+STATUS: gap survey complete; prioritised backlog for M5
+
+* §0 Method
+
+Fed the real SQLite amalgamation (=sqlite3.c=, 241,687 lines) through
+=gcc -E -P= (cfront does not preprocess) → 84,092 lines / 2.47 MB of
+preprocessed C, then through =nelisp-cfront-parse=.  First error recorded;
+construct frequencies counted to prioritise the backlog by real demand.
+
+* §1 First blocker
+
+#+begin_example
+FIRST ERROR: :not-a-type (ident "__builtin_va_list")   ; the very first typedef
+#+end_example
+
+The amalgamation opens with =typedef __builtin_va_list __gnuc_va_list;=.
+The parser stops on the first line: GCC builtin types / =__attribute__=
+are not recognised.
+
+* §2 Construct frequency (what real SQLite needs, by demand)
+
+| construct | count | cfront status | cost |
+|-----------+-------+---------------+------|
+| =__attribute__= | 3066 | ❌ must skip in lexer/parser | low (skip) |
+| =return= | 3645 | ✅ | — |
+| casts =(type)expr= | ~1769 | ❌ | med (parse; ~no-op lower) |
+| designated init =.f =...= | 1426 | ❌ | high |
+| =float= / =double= | 1434 | ❌ (grammar has f64 ops) | high |
+| =case= labels | 1209 | ❌ | high (switch) |
+| =sizeof= | 874 | △ sizeof(type) only | low |
+| =unsigned= | 731 | ✅ (qualifier) | — |
+| *=goto=* | *719* | △ forward-cleanup only | high (relooper / multi-label) |
+| =va_list= / varargs | 153 | ❌ | high (upstream ABI) |
+| aggregate init ={...}= | 149 | ❌ | high |
+| multi-declarator =int a,b;= | 89 | ❌ | med |
+| =do=…=while= | 85 | ❌ | med |
+| =switch= | 80 | ❌ | high |
+| =union= | 60 | ✅ | — |
+| =enum= | 31 | ❌ | med |
+
+* §3 Prioritised backlog for M5 (front-end first, by demand × blocking)
+
+Tier 1 — *parse blockers that appear constantly* (without these, parsing
+stops almost immediately):
+1. =__attribute__= / =__extension__= / GCC builtin types — recognise &
+   skip in the lexer/parser (=__builtin_va_list= → treat as an opaque type).
+2. casts =(type)expr= — parse; lower as (mostly) identity in the untyped
+   i64 model.
+3. multi-declarator (=int a, b;=) and declaration initializers.
+
+Tier 2 — *high-demand language features*:
+4. aggregate + designated initializers (1426+149) — parse + lower to a
+   sequence of field/element stores.
+5. =float=/=double= (1434) — lower onto the existing nelisp-cc f64 grammar
+   ops (=f64-add= etc., =extern-call-f64=); type-track float vs int.
+6. =switch=/=case= (1209 cases) — lower to an if-chain or jump (flag-guarded
+   like break).
+7. =do=…=while=, =enum=.
+
+Tier 3 — *the genuinely hard / upstream items* (Doc 04):
+8. robust =goto= (719) — multi-label / backward needs a relooper.
+9. =varargs= (153, printf-family) — needs the variadic ABI in *nelisp-cc*
+   (upstream).
+10. struct-by-value locals & =&local= — need an =alloca= grammar op in
+    *nelisp-cc* (upstream).
+
+* §4 Honest assessment
+
+Compiling real =sqlite3.c= is a *large, now-quantified* front-end
+expansion (Tiers 1-2 are weeks of cfront work) plus the Tier-3 upstream
+ABI/alloca ops and a relooper.  The M4 residuals (varargs, alloca) are
+NOT the long pole — *casts, initializers, float, and switch* (each
+1000-1800 occurrences) dominate.  M5 should proceed Tier 1 → 2 → 3, each
+verified by re-running this gap probe and watching the first-error line
+advance.
+
+libxml2 (M6) is expected to need the same Tier 1-2 set plus its own
+encoding tables; run the same probe on it before starting.
