@@ -252,6 +252,10 @@ arrow/member lvalue E, or nil."
     ('sizeof-expr (nelisp-cfront-type-size (nelisp-cfront-lower--type-of (nth 1 e))
                                            nelisp-cfront-lower--structs))
     ('cast (nelisp-cfront-lower--expr (nth 2 e)))   ; untyped i64: cast is identity
+    ('va-arg (nelisp-cfront-lower--err :varargs-unsupported e))  ; Tier 3 / upstream
+    ('fnum (nelisp-cfront-lower--err :float-lowering-pending e))  ; needs f64 grammar lower
+    ('comma (nelisp-cfront-lower--seq (list (nelisp-cfront-lower--expr (nth 1 e))
+                                            (nelisp-cfront-lower--expr (nth 2 e)))))
     ((or 'pre 'post) (nelisp-cfront-lower--incdec e))
     ((or 'member 'arrow) (nelisp-cfront-lower--load-lvalue e))
     (_ (nelisp-cfront-lower--err :unsupported-expr e))))
@@ -363,6 +367,29 @@ in this MVP)."
   (prog1 (intern (format "nlcf_brk%d" nelisp-cfront-lower--brk-counter))
     (setq nelisp-cfront-lower--brk-counter (1+ nelisp-cfront-lower--brk-counter))))
 
+(defun nelisp-cfront-lower--gensym (prefix)
+  (prog1 (intern (format "nlcf_%s%d" prefix nelisp-cfront-lower--brk-counter))
+    (setq nelisp-cfront-lower--brk-counter (1+ nelisp-cfront-lower--brk-counter))))
+
+(defun nelisp-cfront-lower--switch-groups (body)
+  "Split a switch BODY block into ((LABEL-NODE . STMTS) ...) groups.
+LABEL-NODE is a `(case V)' or `(default)'.  Statements before the first
+label (unreachable) are dropped."
+  (let ((groups nil) (curlabel nil) (curstmts nil))
+    (dolist (s (if (eq (car body) 'block) (cdr body) (list body)))
+      (if (memq (car s) '(case default))
+          (progn
+            (when curlabel (push (cons curlabel (nreverse curstmts)) groups))
+            (setq curlabel s curstmts nil))
+        (when curlabel (push s curstmts))))
+    (when curlabel (push (cons curlabel (nreverse curstmts)) groups))
+    (nreverse groups)))
+
+(defun nelisp-cfront-lower--switch-anymatch (sw vals)
+  "Grammar test: non-zero iff SW equals any of grammar VALS."
+  (if (null vals) 0
+    `(if (= ,sw ,(car vals)) 1 ,(nelisp-cfront-lower--switch-anymatch sw (cdr vals)))))
+
 (defun nelisp-cfront-lower--body-has-break (s)
   "Non-nil when S contains a `break'/`continue' for THIS loop level
 \(does not descend into nested while/for, which capture their own)."
@@ -398,6 +425,8 @@ in this MVP)."
          ('if (or (nelisp-cfront-lower--has-goto-p (nth 2 node))
                   (nelisp-cfront-lower--has-goto-p (nth 3 node))))
          ('while (nelisp-cfront-lower--has-goto-p (nth 2 node)))
+         ('do-while (nelisp-cfront-lower--has-goto-p (nth 1 node)))
+         ('switch (nelisp-cfront-lower--has-goto-p (nth 2 node)))
          ('for (or (nelisp-cfront-lower--has-goto-p (nth 1 node))
                    (nelisp-cfront-lower--has-goto-p (nth 4 node))))
          (_ nil))))
@@ -412,6 +441,8 @@ in this MVP)."
          ('if (or (nelisp-cfront-lower--return-in-loop-p (nth 2 node) in-loop)
                   (nelisp-cfront-lower--return-in-loop-p (nth 3 node) in-loop)))
          ('while (nelisp-cfront-lower--return-in-loop-p (nth 2 node) t))
+         ('do-while (nelisp-cfront-lower--return-in-loop-p (nth 1 node) t))
+         ('switch (nelisp-cfront-lower--return-in-loop-p (nth 2 node) in-loop))
          ('for (or (nelisp-cfront-lower--return-in-loop-p (nth 1 node) in-loop)
                    (nelisp-cfront-lower--return-in-loop-p (nth 4 node) t)))
          (_ nil))))
@@ -504,6 +535,12 @@ Only a single top-level forward label (the cleanup pattern) is supported."
             ,(if (nth 3 s) (nelisp-cfront-lower--effect (nth 3 s)) 0)))
     ('while (nelisp-cfront-lower--lower-loop (nth 1 s) (nth 2 s) nil))
     ('for (nelisp-cfront-lower--for s))
+    ('do-while                            ; do BODY while(C)  ==  while(1){BODY; if(!C)break;}
+     (nelisp-cfront-lower--lower-loop
+      '(int 1)
+      `(block ,(nth 1 s) (if (unop "!" ,(nth 2 s)) (break) nil))
+      nil))
+    ('switch (nelisp-cfront-lower--lower-switch s))
     ('break (if nelisp-cfront-lower--brk-stack
                 `(setq ,(car nelisp-cfront-lower--brk-stack) 1)
               (nelisp-cfront-lower--err :break-outside-loop s)))
@@ -528,6 +565,45 @@ Only a single top-level forward label (the cleanup pattern) is supported."
     (nelisp-cfront-lower--seq
      (append (when init (list (nelisp-cfront-lower--effect init)))
              (list (nelisp-cfront-lower--lower-loop (or cnd '(int 1)) body step))))))
+
+(defun nelisp-cfront-lower--lower-switch (s)
+  "Lower a `switch' via a matched-flag linear scan (fall-through + break).
+Each case runs when (matched OR value==label); break (the innermost flag)
+guards later cases; default runs when matched OR no case value matched."
+  (let* ((e (nth 1 s)) (body (nth 2 s))
+         (sw (nelisp-cfront-lower--gensym "sw"))
+         (m  (nelisp-cfront-lower--gensym "swm"))
+         (bf (nelisp-cfront-lower--gensym "swb"))
+         (groups (nelisp-cfront-lower--switch-groups body))
+         (case-vals (delq nil (mapcar
+                               (lambda (g) (and (eq (car (car g)) 'case)
+                                                (nelisp-cfront-lower--expr (nth 1 (car g)))))
+                               groups))))
+    (push sw nelisp-cfront-lower--synth)
+    (push m nelisp-cfront-lower--synth)
+    (push bf nelisp-cfront-lower--synth)
+    (let* ((anymatch (nelisp-cfront-lower--switch-anymatch sw case-vals))
+           (nelisp-cfront-lower--brk-stack (cons bf nelisp-cfront-lower--brk-stack))
+           (group-forms
+            (mapcar
+             (lambda (g)
+               (let* ((label (car g)) (stmts (cdr g))
+                      (match (if (eq (car label) 'case)
+                                 `(if (= ,m 0)
+                                      (if (= ,sw ,(nelisp-cfront-lower--expr (nth 1 label))) 1 0)
+                                    1)
+                               `(if (= ,m 0) (if ,anymatch 0 1) 1))))
+                 `(if (= ,bf 0)
+                      (if ,match
+                          ,(nelisp-cfront-lower--seq
+                            (list `(setq ,m 1)
+                                  (nelisp-cfront-lower--stmts-effect stmts)))
+                        0)
+                    0)))
+             groups)))
+      (nelisp-cfront-lower--seq
+       (append (list `(setq ,sw ,(nelisp-cfront-lower--expr e)) `(setq ,m 0))
+               group-forms)))))
 
 (defun nelisp-cfront-lower--tail (s void-p)
   "Lower statement S in tail (return-value) position."

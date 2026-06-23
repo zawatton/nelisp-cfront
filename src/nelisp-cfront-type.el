@@ -190,6 +190,9 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
     ('ternary (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('cast (nth 1 expr))                ; a cast yields the cast-to type
     ((or 'sizeof 'sizeof-expr) (nelisp-cfront-type-long))
+    ('va-arg (nth 2 expr))              ; va_arg(ap, TYPE) yields TYPE
+    ('fnum '(:base double :ptr 0))
+    ('comma (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     (_ (nelisp-cfront-type-long))))
 
 (provide 'nelisp-cfront-type)

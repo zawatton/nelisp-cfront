@@ -176,11 +176,32 @@ The final token is (eof nil POS).  Signals `nelisp-cfront-lex-error'."
                           word pos)
                     toks)
               (setq i j))))
-         ;; number
+         ;; number (integer or floating-point)
          ((nelisp-cfront-lex--digit-p c)
-          (let ((r (nelisp-cfront-lex--number s i n)))
-            (push (list 'int (car r) pos) toks)
-            (setq i (cdr r))))
+          (if (and (= c ?0) (< (1+ i) n) (memq (aref s (1+ i)) '(?x ?X)))
+              (let ((r (nelisp-cfront-lex--number s i n)))  ; hex integer
+                (push (list 'int (car r) pos) toks) (setq i (cdr r)))
+            ;; decimal: scan leading digits, then decide int vs float
+            (let ((j i))
+              (while (and (< j n) (nelisp-cfront-lex--digit-p (aref s j))) (setq j (1+ j)))
+              (if (or (and (< j n) (= (aref s j) ?.))
+                      (and (< j n) (memq (aref s j) '(?e ?E))))
+                  ;; floating-point literal
+                  (let ((start i))
+                    (setq i j)
+                    (when (and (< i n) (= (aref s i) ?.))
+                      (setq i (1+ i))
+                      (while (and (< i n) (nelisp-cfront-lex--digit-p (aref s i))) (setq i (1+ i))))
+                    (when (and (< i n) (memq (aref s i) '(?e ?E)))
+                      (setq i (1+ i))
+                      (when (and (< i n) (memq (aref s i) '(?+ ?-))) (setq i (1+ i)))
+                      (while (and (< i n) (nelisp-cfront-lex--digit-p (aref s i))) (setq i (1+ i))))
+                    (let ((lex (substring s start i)))
+                      (while (and (< i n) (memq (aref s i) '(?f ?F ?l ?L))) (setq i (1+ i)))
+                      (push (list 'float (string-to-number lex) pos) toks)))
+                ;; integer (decimal / octal) via the integer scanner
+                (let ((r (nelisp-cfront-lex--number s i n)))
+                  (push (list 'int (car r) pos) toks) (setq i (cdr r)))))))
          ;; char literal
          ((= c ?')
           (setq i (1+ i))

@@ -56,9 +56,6 @@
 (defconst nelisp-cfront-parse--builtin-typedefs
   '(("__builtin_va_list" . (:base long :ptr 1))
     ("__gnuc_va_list"    . (:base long :ptr 1))
-    ("__int128"          . (:base long :ptr 0))
-    ("__int128_t"        . (:base long :ptr 0))
-    ("__uint128_t"       . (:base long :ptr 0 :unsigned t))
     ("_Float16"  . (:base float :ptr 0))
     ("_Float32"  . (:base float :ptr 0))
     ("_Float32x" . (:base double :ptr 0))
@@ -93,12 +90,16 @@
          ;; bare GCC-ism keywords-as-idents: just drop
          ((and (eq ty 'ident) (member v nelisp-cfront-parse--gcc-ignore))
           (setq rest (cdr rest)))
+         ;; __int128 family: rewrite to `long' so `unsigned __int128' combines
+         ((and (eq ty 'ident) (member v '("__int128" "__int128_t" "__uint128_t")))
+          (push (list 'keyword "long" (nth 2 tk)) out) (setq rest (cdr rest)))
          (t (push tk out) (setq rest (cdr rest))))))
     (nreverse out)))
 
 (defconst nelisp-cfront-parse--type-keywords
   '("void" "char" "short" "int" "long" "float" "double" "unsigned" "signed"
-    "const" "struct" "union" "enum" "static" "extern" "_Bool")
+    "const" "struct" "union" "enum" "static" "extern" "_Bool"
+    "register" "auto" "volatile" "inline" "restrict")
   "Keywords that may begin / appear in a type-specifier sequence.")
 
 ;;; --- cursor ----------------------------------------------------------
@@ -175,7 +176,7 @@
         (cond
          ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
          ((string= w "unsigned") (setq unsigned t))
-         ((string= w "signed") nil)
+         ((string= w "signed") (push "int" specs))   ; `signed' alone => int
          ((or (string= w "struct") (string= w "union"))
           (when (string= w "union") (setq is-union t))
           (when (nelisp-cfront-parse--at 'ident)         ; tag is optional (anonymous)
@@ -246,10 +247,13 @@
     (while (not (nelisp-cfront-parse--at-punct "}"))
       (let* ((fty (nelisp-cfront-parse--parse-type))
              (fname nil) (bits nil))
-        (if (nelisp-cfront-parse--at-fnptr-declarator)   ; fn-ptr field: ret (*f)(...)
-            (let ((fp (nelisp-cfront-parse--parse-fnptr-name fty)))
-              (setq fty (cdr fp) fname (car fp)))
-          (setq fname (nelisp-cfront-parse--eat-ident)))
+        (cond
+         ((nelisp-cfront-parse--at-fnptr-declarator)   ; fn-ptr field: ret (*f)(...)
+          (let ((fp (nelisp-cfront-parse--parse-fnptr-name fty)))
+            (setq fty (cdr fp) fname (car fp))))
+         ((nelisp-cfront-parse--at-punct ":") (setq fname nil))  ; anonymous bitfield
+         ((nelisp-cfront-parse--at-punct ";") (setq fname nil))  ; anonymous struct/union member
+         (t (setq fname (nelisp-cfront-parse--eat-ident))))
         (cond
          ;; bitfield: TYPE NAME : WIDTH
          ((nelisp-cfront-parse--at-punct ":")
@@ -369,7 +373,13 @@ arrays), so this is parse-only for now."
   "Assignment operators (right-associative, lowest precedence).")
 
 (defun nelisp-cfront-parse--parse-expr ()
-  (nelisp-cfront-parse--parse-assign))
+  ;; full expression: assignment-expr, then the comma operator (args and
+  ;; initializers use parse-assign directly, so commas there don't apply)
+  (let ((e (nelisp-cfront-parse--parse-assign)))
+    (while (nelisp-cfront-parse--at-punct ",")
+      (nelisp-cfront-parse--advance)
+      (setq e (list 'comma e (nelisp-cfront-parse--parse-assign))))
+    e))
 
 (defun nelisp-cfront-parse--parse-assign ()
   (let ((lhs (nelisp-cfront-parse--parse-ternary)))
@@ -414,6 +424,14 @@ arrays), so this is parse-only for now."
            (nelisp-cfront-parse--token-starts-type (cadr nelisp-cfront-parse--toks)))
       (nelisp-cfront-parse--advance)
       (let ((ty (nelisp-cfront-parse--parse-type)))
+        ;; abstract fn-ptr declarator in a cast: (RET (*)(params))
+        (when (nelisp-cfront-parse--at-fnptr-declarator)
+          (setq ty (cdr (nelisp-cfront-parse--parse-fnptr-name ty))))
+        ;; abstract array declarator in a cast: (T[N])
+        (while (nelisp-cfront-parse--at-punct "[")
+          (nelisp-cfront-parse--advance)
+          (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+          (nelisp-cfront-parse--eat-punct "]"))
         (nelisp-cfront-parse--eat-punct ")")
         (list 'cast ty (nelisp-cfront-parse--parse-unary))))
      ((and (eq (nth 0 tk) 'punct) (member (nth 1 tk) '("++" "--")))
@@ -442,14 +460,22 @@ arrays), so this is parse-only for now."
         (cond
          ((nelisp-cfront-parse--at-punct "(")
           (nelisp-cfront-parse--advance)
-          (let ((args nil))
-            (unless (nelisp-cfront-parse--at-punct ")")
-              (push (nelisp-cfront-parse--parse-assign) args)
-              (while (nelisp-cfront-parse--at-punct ",")
-                (nelisp-cfront-parse--advance)
-                (push (nelisp-cfront-parse--parse-assign) args)))
-            (nelisp-cfront-parse--eat-punct ")")
-            (setq e (list 'call e (nreverse args)))))
+          (if (and (eq (car e) 'var)
+                   (member (nth 1 e) '("__builtin_va_arg" "va_arg")))
+              ;; va_arg(ap, TYPE) — the 2nd argument is a type, not an expr
+              (let ((ap (nelisp-cfront-parse--parse-assign)))
+                (nelisp-cfront-parse--eat-punct ",")
+                (let ((ty (nelisp-cfront-parse--parse-type)))
+                  (nelisp-cfront-parse--eat-punct ")")
+                  (setq e (list 'va-arg ap ty))))
+            (let ((args nil))
+              (unless (nelisp-cfront-parse--at-punct ")")
+                (push (nelisp-cfront-parse--parse-assign) args)
+                (while (nelisp-cfront-parse--at-punct ",")
+                  (nelisp-cfront-parse--advance)
+                  (push (nelisp-cfront-parse--parse-assign) args)))
+              (nelisp-cfront-parse--eat-punct ")")
+              (setq e (list 'call e (nreverse args))))))
          ((nelisp-cfront-parse--at-punct "[")
           (nelisp-cfront-parse--advance)
           (let ((idx (nelisp-cfront-parse--parse-expr)))
@@ -470,8 +496,13 @@ arrays), so this is parse-only for now."
   (let ((tk (nelisp-cfront-parse--peek)))
     (pcase (nth 0 tk)
       ('int  (nelisp-cfront-parse--advance) (list 'int (nth 1 tk)))
+      ('float (nelisp-cfront-parse--advance) (list 'fnum (nth 1 tk)))
       ('char (nelisp-cfront-parse--advance) (list 'int (nth 1 tk)))
-      ('string (nelisp-cfront-parse--advance) (list 'str (nth 1 tk)))
+      ('string (nelisp-cfront-parse--advance)
+               (let ((str (nth 1 tk)))    ; adjacent string-literal concatenation
+                 (while (nelisp-cfront-parse--at 'string)
+                   (setq str (concat str (nth 1 (nelisp-cfront-parse--advance)))))
+                 (list 'str str)))
       ('ident (nelisp-cfront-parse--advance) (list 'var (nth 1 tk)))
       ('punct
        (if (string= (nth 1 tk) "(")
@@ -531,6 +562,30 @@ arrays), so this is parse-only for now."
                (nelisp-cfront-parse--parse-expr))))
       (nelisp-cfront-parse--eat-punct ";")
       (list 'return e)))
+   ((nelisp-cfront-parse--at-kw "switch")
+    (nelisp-cfront-parse--advance)
+    (nelisp-cfront-parse--eat-punct "(")
+    (let ((e (nelisp-cfront-parse--parse-expr)))
+      (nelisp-cfront-parse--eat-punct ")")
+      (list 'switch e (nelisp-cfront-parse--parse-stmt))))
+   ((nelisp-cfront-parse--at-kw "case")
+    (nelisp-cfront-parse--advance)
+    (let ((v (nelisp-cfront-parse--parse-expr)))
+      (nelisp-cfront-parse--eat-punct ":")
+      (list 'case v)))
+   ((nelisp-cfront-parse--at-kw "default")
+    (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-punct ":") (list 'default))
+   ((nelisp-cfront-parse--at-kw "do")
+    (nelisp-cfront-parse--advance)
+    (let ((body (nelisp-cfront-parse--parse-stmt)))
+      (unless (nelisp-cfront-parse--at-kw "while")
+        (signal 'nelisp-cfront-parse-error (list :do-without-while)))
+      (nelisp-cfront-parse--advance)
+      (nelisp-cfront-parse--eat-punct "(")
+      (let ((cnd (nelisp-cfront-parse--parse-expr)))
+        (nelisp-cfront-parse--eat-punct ")")
+        (nelisp-cfront-parse--eat-punct ";")
+        (list 'do-while body cnd))))
    ((nelisp-cfront-parse--at-kw "break")
     (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-punct ";") (list 'break))
    ((nelisp-cfront-parse--at-kw "continue")
