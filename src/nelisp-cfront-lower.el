@@ -230,13 +230,13 @@ FROM-FLOAT-P / TO-FLOAT-P flags."
                    ,(nelisp-cfront-lower--elem-size (nth 1 e)))))
     ('arrow
      (let* ((pty (nelisp-cfront-lower--type-of (nth 1 e)))
-            (fld (nelisp-cfront-type-field (plist-get pty :struct) (nth 2 e)
-                                           nelisp-cfront-lower--structs)))
+            (fld (nelisp-cfront-type-field-ty pty (nth 2 e)
+                                              nelisp-cfront-lower--structs)))
        `(+ ,(nelisp-cfront-lower--expr (nth 1 e)) ,(plist-get fld :offset))))
     ('member
      (let* ((oty (nelisp-cfront-lower--type-of (nth 1 e)))
-            (fld (nelisp-cfront-type-field (plist-get oty :struct) (nth 2 e)
-                                           nelisp-cfront-lower--structs)))
+            (fld (nelisp-cfront-type-field-ty oty (nth 2 e)
+                                              nelisp-cfront-lower--structs)))
        `(+ ,(nelisp-cfront-lower--addr (nth 1 e)) ,(plist-get fld :offset))))
     (_ (nelisp-cfront-lower--err :not-an-lvalue e))))
 
@@ -245,10 +245,11 @@ FROM-FLOAT-P / TO-FLOAT-P flags."
 arrow/member lvalue E, or nil."
   (pcase (car e)
     ((or 'arrow 'member)
-     (let ((sname (plist-get (nelisp-cfront-lower--type-of (nth 1 e)) :struct)))
-       (and sname (ignore-errors
-                    (nelisp-cfront-type-field sname (nth 2 e)
-                                              nelisp-cfront-lower--structs)))))
+     (let ((oty (nelisp-cfront-lower--type-of (nth 1 e))))
+       (and (eq (plist-get oty :base) 'struct)
+            (ignore-errors
+              (nelisp-cfront-type-field-ty oty (nth 2 e)
+                                           nelisp-cfront-lower--structs)))))
     (_ nil)))
 
 (defun nelisp-cfront-lower--bitfield-assign (lhs op grhs fld)

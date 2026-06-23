@@ -342,3 +342,30 @@ The backlog is now ranked by real demand:
 
 Re-run =make lower-gap FILE=...= after each fix to watch coverage climb.
 
+** §10.1 =:unknown-struct= crushed (1065 → 93; coverage 36% → 55%)
+
+Root cause was *anonymous / inline-defined struct & union members*: the
+type machinery only resolved a struct by *tag name*, so a member like
+glibc =__mbstate_t='s anonymous =union {...} __value= (stored as
+=:base struct :struct nil :fields (...)=) failed =type-struct nil=, which
+made =type-build-structs= skip the whole enclosing struct — and every
+function touching it then failed =:unknown-struct=.  Just 224 of 267
+structs laid out.
+
+Fix: =type--resolve-struct= computes a struct/union's layout from its
+inline =:fields= when present, else by tag.  Wired into =type-size=,
+=type-align=, and a new =type-field-ty= (member access by type, not tag).
+Result: *266/267 structs lay out*; =:unknown-struct= dropped 1065 → 362
+(type-size/align) → 93 (type-field-ty); coverage 36.2% → 50.3% → 55.1%
+(1,318 / 2,392 functions).
+
+The residual 93 are mostly *global variables* of struct type (e.g.
+=sqlite3Stat.nowValue[op]= in =sqlite3StatusValue=): cfront defers
+globals, so a global isn't in =tenv=, types as =long=, and member access
+fails.  Global-variable support is a separate feature.  (The last
+un-laid-out struct, =RowSetChunk=, has a =sizeof(struct)= array
+dimension — needs parse-deferred dim evaluation.)
+
+After this, the dominant bucket is =:unsupported-load-width= (388 —
+struct-by-value loads), the natural next lowering target.
+

@@ -35,6 +35,16 @@
     ('float 4) ('double 8)
     (_ (signal 'nelisp-cfront-type-error (list :unknown-base base)))))
 
+(defun nelisp-cfront-type--resolve-struct (ty structs)
+  "Layout plist (:size/:align/:fields) for a struct/union TYPE.
+Prefers TY's inline `:fields' (anonymous members and inline-defined
+structs/unions) — computing the layout directly — and otherwise looks
+the tag up in STRUCTS by name."
+  (let ((fields (plist-get ty :fields)))
+    (if fields
+        (nelisp-cfront-type-layout fields structs (plist-get ty :union))
+      (nelisp-cfront-type-struct (plist-get ty :struct) structs))))
+
 (defun nelisp-cfront-type-size (ty structs)
   "Byte size of type TY given the STRUCTS table."
   (let ((ptr (or (plist-get ty :ptr) 0))
@@ -46,8 +56,7 @@
              (nelisp-cfront-type--const arr)))
      ((> ptr 0) 8)
      ((eq (plist-get ty :base) 'struct)
-      (let ((s (nelisp-cfront-type-struct (plist-get ty :struct) structs)))
-        (plist-get s :size)))
+      (plist-get (nelisp-cfront-type--resolve-struct ty structs) :size))
      (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
 
 (defun nelisp-cfront-type-align (ty structs)
@@ -58,7 +67,7 @@
      ((plist-get ty :array)
       (nelisp-cfront-type-align (nelisp-cfront-type--strip-array ty) structs))
      ((eq (plist-get ty :base) 'struct)
-      (plist-get (nelisp-cfront-type-struct (plist-get ty :struct) structs) :align))
+      (plist-get (nelisp-cfront-type--resolve-struct ty structs) :align))
      (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
 
 (defun nelisp-cfront-type--strip-array (ty)
@@ -154,6 +163,15 @@ Also scans inline `:fields' on struct types in params/decls."
                                    :fields)))
       (signal 'nelisp-cfront-type-error (list :unknown-field struct-name field))))
 
+(defun nelisp-cfront-type-field-ty (ty field structs)
+  "Return the field plist for FIELD of struct/union TYPE TY.
+Resolves TY's inline `:fields' (anonymous / inline-defined members) or
+its tag, so member access works on anonymous struct/union types too."
+  (or (cdr (assoc field (plist-get (nelisp-cfront-type--resolve-struct ty structs)
+                                   :fields)))
+      (signal 'nelisp-cfront-type-error
+              (list :unknown-field (plist-get ty :struct) field))))
+
 ;;; --- type plist helpers ---------------------------------------------
 
 (defun nelisp-cfront-type-pointee (ty)
@@ -190,13 +208,11 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
     ('str (list :base 'char :ptr 1))
     ('var (or (cdr (assoc (nth 1 expr) tenv)) (nelisp-cfront-type-long)))
     ('arrow
-     (let* ((pty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs))
-            (sname (plist-get pty :struct)))
-       (plist-get (nelisp-cfront-type-field sname (nth 2 expr) structs) :type)))
+     (let ((pty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs)))
+       (plist-get (nelisp-cfront-type-field-ty pty (nth 2 expr) structs) :type)))
     ('member
-     (let* ((oty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs))
-            (sname (plist-get oty :struct)))
-       (plist-get (nelisp-cfront-type-field sname (nth 2 expr) structs) :type)))
+     (let ((oty (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs)))
+       (plist-get (nelisp-cfront-type-field-ty oty (nth 2 expr) structs) :type)))
     ('index
      (nelisp-cfront-type-elem
       (nelisp-cfront-type-of (nth 1 expr) tenv structs funcs)))
