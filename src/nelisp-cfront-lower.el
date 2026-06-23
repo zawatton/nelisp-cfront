@@ -675,21 +675,64 @@ label (unreachable) are dropped."
                    (nelisp-cfront-lower--has-goto-p (nth 4 node))))
          (_ nil))))
 
-(defun nelisp-cfront-lower--return-in-loop-p (node in-loop)
-  "Non-nil when NODE contains a `return' lexically inside a loop."
+(defun nelisp-cfront-lower--has-return-p (node)
+  "Non-nil when NODE contains a `return' anywhere."
   (and (consp node)
        (pcase (car node)
-         ('return in-loop)
-         ('block (cl-some (lambda (s) (nelisp-cfront-lower--return-in-loop-p s in-loop))
-                          (cdr node)))
-         ('if (or (nelisp-cfront-lower--return-in-loop-p (nth 2 node) in-loop)
-                  (nelisp-cfront-lower--return-in-loop-p (nth 3 node) in-loop)))
-         ('while (nelisp-cfront-lower--return-in-loop-p (nth 2 node) t))
-         ('do-while (nelisp-cfront-lower--return-in-loop-p (nth 1 node) t))
-         ('switch (nelisp-cfront-lower--return-in-loop-p (nth 2 node) in-loop))
-         ('for (or (nelisp-cfront-lower--return-in-loop-p (nth 1 node) in-loop)
-                   (nelisp-cfront-lower--return-in-loop-p (nth 4 node) t)))
+         ('return t)
+         ((or 'block 'decls) (cl-some #'nelisp-cfront-lower--has-return-p (cdr node)))
+         ('if (or (nelisp-cfront-lower--has-return-p (nth 2 node))
+                  (nelisp-cfront-lower--has-return-p (nth 3 node))))
+         ('while (nelisp-cfront-lower--has-return-p (nth 2 node)))
+         ('do-while (nelisp-cfront-lower--has-return-p (nth 1 node)))
+         ('switch (nelisp-cfront-lower--has-return-p (nth 2 node)))
+         ('for (or (nelisp-cfront-lower--has-return-p (nth 1 node))
+                   (nelisp-cfront-lower--has-return-p (nth 4 node))))
          (_ nil))))
+
+;; Single-exit detection precisely mirrors the tail-lowering rules
+;; (`--stmts-tail' / `--tail' / `--block-tail').  A function needs the
+;; return flag iff some `return' would be lowered through `--effect'
+;; rather than guard-lifted in tail position — this subsumes returns in
+;; loops, switches, and partially-returning if/else-if chains.
+
+(defun nelisp-cfront-lower--tail-effect-return-p (s)
+  "Non-nil when lowering statement S in TAIL position routes some return
+through `--effect' (i.e. needs the return flag)."
+  (and (consp s)
+       (pcase (car s)
+         ('return nil)                  ; a tail return is emitted directly
+         ('block (nelisp-cfront-lower--stmts-tail-effect-return-p (cdr s)))
+         ('if (or (nelisp-cfront-lower--tail-effect-return-p (nth 2 s))
+                  (and (nth 3 s) (nelisp-cfront-lower--tail-effect-return-p (nth 3 s)))))
+         ;; any other statement in tail position runs via `--effect'
+         (_ (nelisp-cfront-lower--has-return-p s)))))
+
+(defun nelisp-cfront-lower--stmts-tail-effect-return-p (stmts)
+  "Non-nil when lowering STMTS as a tail sequence (per `--stmts-tail')
+routes some return through `--effect'."
+  (cond
+   ((null stmts) nil)
+   ((null (cdr stmts)) (nelisp-cfront-lower--tail-effect-return-p (car stmts)))
+   (t
+    (let ((s (car stmts)) (rest (cdr stmts)))
+      (cond
+       ;; if/else where both branches return: both lowered in tail
+       ((and (eq (car s) 'if) (nth 3 s)
+             (nelisp-cfront-lower--always-returns-p (nth 2 s))
+             (nelisp-cfront-lower--always-returns-p (nth 3 s)))
+        (or (nelisp-cfront-lower--tail-effect-return-p (nth 2 s))
+            (nelisp-cfront-lower--tail-effect-return-p (nth 3 s))))
+       ;; guard `if (c) <returns>;': then in tail, rest in tail
+       ((and (eq (car s) 'if) (null (nth 3 s))
+             (nelisp-cfront-lower--always-returns-p (nth 2 s)))
+        (or (nelisp-cfront-lower--tail-effect-return-p (nth 2 s))
+            (nelisp-cfront-lower--stmts-tail-effect-return-p rest)))
+       ;; otherwise S runs via `--effect' (any return in it is an effect
+       ;; return), and the rest continues in tail position
+       (t
+        (or (nelisp-cfront-lower--has-return-p s)
+            (nelisp-cfront-lower--stmts-tail-effect-return-p rest))))))))
 
 (defun nelisp-cfront-lower--exit-stmt-p (s)
   "Non-nil when S always exits the current iteration (break/continue/return)."
@@ -860,13 +903,17 @@ guards later cases; default runs when matched OR no case value matched."
                                       (if (= ,sw ,(nelisp-cfront-lower--expr (nth 1 label))) 1 0)
                                     1)
                                `(if (= ,m 0) (if ,anymatch 0 1) 1))))
-                 `(if (= ,bf 0)
-                      (if ,match
-                          ,(nelisp-cfront-lower--seq
-                            (list `(setq ,m 1)
-                                  (nelisp-cfront-lower--stmts-effect stmts)))
-                        0)
-                    0)))
+                 ;; Skip this case group once ANY active exit flag is set —
+                 ;; the switch break flag (bf), plus the function return /
+                 ;; goto flags in single-exit mode — so `return' inside a
+                 ;; case correctly bypasses the remaining cases.
+                 (nelisp-cfront-lower--guard-clear
+                  (nelisp-cfront-lower--active-exit-flags)
+                  `(if ,match
+                       ,(nelisp-cfront-lower--seq
+                         (list `(setq ,m 1)
+                               (nelisp-cfront-lower--stmts-effect stmts)))
+                     0))))
              groups)))
       (nelisp-cfront-lower--seq
        (append (list `(setq ,sw ,(nelisp-cfront-lower--expr e)) `(setq ,m 0))
@@ -969,7 +1016,8 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (nelisp-cfront-lower--brk-stack nil)
          (nelisp-cfront-lower--brk-counter 0)
          (has-goto (nelisp-cfront-lower--has-goto-p body))
-         (needs-exit (or (nelisp-cfront-lower--return-in-loop-p body nil) has-goto))
+         (needs-exit (or (nelisp-cfront-lower--stmts-tail-effect-return-p (cdr body))
+                         has-goto))
          (nelisp-cfront-lower--ret-mode
           (and needs-exit (cons 'nlcf_retset 'nlcf_retval)))
          (nelisp-cfront-lower--goto-flag (and has-goto 'nlcf_goto))

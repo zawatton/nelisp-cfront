@@ -183,6 +183,45 @@ int main(void){
     (should (equal "42 6 100 20 49" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-e2e-early-return-single-exit ()
+  "Early returns lowered via single-exit mode: a partially-returning
+if/else-if chain followed by a tail return, returns inside a switch, and
+a return inside a loop.  (long params throughout — narrow `int' params
+hit a separate ABI sign-extension gap, see docs/design/05 §10.4.)"
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+long classify(long x){
+  if (x < 0) return -1;
+  else if (x == 0) return 0;
+  else if (x < 10) return 1;
+  return 2;
+}
+long sw_ret(long op){
+  switch(op){ case 1: return 10; case 2: return 20; default: return 99; }
+}
+long loop_ret(long *a, long n, long key){
+  long i;
+  for (i = 0; i < n; i = i + 1){ if (a[i] == key) return i; }
+  return -1;
+}
+")
+         (drv "
+#include <stdio.h>
+extern long classify(long); extern long sw_ret(long); extern long loop_ret(long*,long,long);
+int main(void){
+  long a[4] = {7,3,9,5};
+  long c1=classify(-5),c2=classify(0),c3=classify(5),c4=classify(50);
+  long s=sw_ret(1)+sw_ret(2)+sw_ret(7);
+  long l=loop_ret(a,4,9), l2=loop_ret(a,4,100);
+  printf(\"%ld %ld %ld %ld %ld %ld %ld\\n\", c1,c2,c3,c4,s,l,l2);
+  return (c1==-1&&c2==0&&c3==1&&c4==2&&s==129&&l==2&&l2==-1)?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "-1 0 1 2 129 2 -1" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-e2e-test)
 
 ;;; nelisp-cfront-e2e-test.el ends here

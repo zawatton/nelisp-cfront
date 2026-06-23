@@ -412,3 +412,38 @@ Dominant bucket now =:string-literal-unsupported= (263 — object-mode
 rodata string pool), then =:early-return-in-loop= (136) and
 =:unknown-struct= (128 — globals).
 
+** §10.4 =:early-return-in-loop= crushed (136 → 0; coverage 71% → 75%)
+
+The single-exit detector (=--return-in-loop-p=) only flagged returns
+inside *loops*, but a return is lowered via =--effect= (and so needs the
+return flag) in three shapes: loops, =switch= case bodies, AND a
+partially-returning =if/else-if= chain followed by more statements (e.g.
+=parseDateOrTime='s =if(..)return; else if(..)return; ... return 1;= —
+the chain isn't all-returning, so =--stmts-tail= lowers it via effect).
+
+Fix: replace the loop-only check with =--stmts-tail-effect-return-p= /
+=--tail-effect-return-p=, which *precisely mirror* the tail-lowering rules
+(=--stmts-tail= / =--tail=) and report any return that would route
+through =--effect= — subsuming loops, switches, and if-chains.  Also
+guard switch case groups by all active exit flags (so =return= in a case
+bypasses later cases).
+
+Result: =:early-return-in-loop= 136 → *0*; coverage 70.8% → *75.2%*
+(1,798 / 2,392 functions).  Verified e2e (=long= params): a
+partially-returning if/else-if chain (=classify=), =switch= returns
+(=sw_ret=), and a loop return (=loop_ret=) → =-1 0 1 2 129 2 -1=.
+
+*** §10.4.1 Discovered: narrow-int ABI sign-extension gap (separate bug)
+
+The e2e above uses =long= params deliberately.  Writing =classify= with an
+=int= param returns the wrong branch for negatives: cfront treats every
+value as i64 and reads the full 64-bit argument register, but the SysV
+caller passes a 32-bit =int= in the low half (=mov edi,-5= *zero*-extends
+=rdi= to =0xFFFFFFFB=).  So a negative =int= arg reads as a large positive
+i64 and signed =<= (=setl=, correctly signed in the grammar) gives the
+wrong result.  This is a pre-existing correctness gap (cfront's "all i64"
+model vs C's sub-64-bit integer widths), invisible to =lower-gap= (which
+checks only that lowering *succeeds*).  Fixing it needs narrow-int
+sign-extension on param load / truncation on narrow ops — a separate,
+broad task tracked for after the coverage sweep.
+
