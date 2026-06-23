@@ -98,6 +98,35 @@ double neg(double x){ return -x; }
     (should (equal "29.5 10 -1 0 3 -2.5" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-float-arg-coercion-e2e ()
+  "Call arguments are coerced to the callee's param class: an int arg to
+a `double' param is lifted to double-bits (i2d) before the call."
+  (unless (nelisp-cfront-float-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-float-test--run "
+double scale(double x, double factor){ return x * factor; }
+double half(double x){ return scale(x, 0.5); }
+double fromint(int n){ return scale(n, 2.0); }
+long trunc_scaled(double x){ return (long)scale(x, 3); }
+" "
+#include <stdio.h>
+#include <string.h>
+extern long half(long);
+extern long fromint(long);
+extern long trunc_scaled(long);
+static long B(double d){long x;memcpy(&x,&d,8);return x;}
+static double U(long x){double d;memcpy(&d,&x,8);return d;}
+int main(void){
+  double h = U(half(B(10.0)));    /* 5.0 */
+  double fi = U(fromint(7));       /* scale(7.0,2.0)=14.0 (int arg coerced) */
+  long ts = trunc_scaled(B(2.5));  /* (long)(2.5*3.0)=7 (int literal coerced) */
+  printf(\"%g %g %ld\\n\", h, fi, ts);
+  return (h==5.0 && fi==14.0 && ts==7)?0:1;
+}
+")))
+    (should (equal "5 14 7" (cdr res)))
+    (should (= 0 (car res)))))
+
 (ert-deftest nelisp-cfront-float-double-to-bits-exact ()
   "The IEEE-754 encoder is bit-exact for representative literals."
   (should (= (nelisp-cfront-float--double-to-bits 1.5)

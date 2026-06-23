@@ -197,8 +197,7 @@ graphs (= SQLite's own float math).  Interop with the external SysV
 =extern-call-f64= + =f64-bits= shim — a documented follow-on.
 
 *Remaining lowering gaps* (next): aggregate/array-local storage
-(=alloca=, upstream); float call-arg coercion (needs param-type tracking
-in the funcs table).
+(=alloca=, upstream).  [float call-arg coercion — DONE, §8.]
 
 * §7 Enum constants — DONE
 
@@ -215,4 +214,25 @@ bare + tagged + flag enums (=F2 = 1<<1=, =FALL = F1|F2|F3=) compiles and
 runs natively — =pick(1)=2 pick(5)=101 vals()=210 colors()=222
 flags()=7=.  =make gap= unchanged at line 24756 (no parse regression:
 all enums in the parsed prefix fold cleanly).  Suite 57/57 green.
+
+* §8 Float call-arg coercion — DONE
+
+=lower.el= now tracks a =--func-params= table (NAME -> positional list of
+param types, built from =func=/=proto= top-levels; the =(void)= marker is
+dropped, unnamed prototype params kept so positions stay aligned).  A
+direct call coerces each argument to its callee's param class via
+=--coerce= (=i2d= for an int arg into a =double= param, =d2i= for the
+reverse); arguments beyond the param list (varargs) pass through
+uncoerced, as do fn-pointer calls (param types not tracked there).
+
+Verified end-to-end (=nelisp-cfront-float-test.el::...-arg-coercion-e2e=):
+=fromint(7)= → =scale(7.0, 2.0) = 14.0= (the int =7= is lifted to
+double-bits before the call), =half(10.0) = 5.0=, =trunc_scaled(2.5) = 7=
+(int literal =3= coerced to =3.0=).  Suite 58/58 green; =make gap=
+unchanged at 24756.
+
+With §6 (arithmetic/locals/conversions), §8 (call args), the only
+remaining float gap is the *external* SysV =double= ABI (xmm0 returns/
+args for non-cfront callers) — a thin =extern-call-f64= + =f64-bits=
+shim, deferred until an external double boundary actually needs it.
 

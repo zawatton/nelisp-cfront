@@ -45,6 +45,9 @@ helpers; `lower-program' then prepends the helper defuns.")
   "Struct table (name->layout) for the program being lowered.")
 (defvar nelisp-cfront-lower--funcs nil
   "Function return-type table (name->type) for the program.")
+(defvar nelisp-cfront-lower--func-params nil
+  "Function parameter-type table (name->list-of-param-types) for the
+program, used to coerce call arguments between int and double-bits.")
 (defvar nelisp-cfront-lower--tenv nil
   "Type environment (var-name->type) for the current function.")
 (defvar nelisp-cfront-lower--synth nil
@@ -281,6 +284,24 @@ arrow/member lvalue E, or nil."
         (push (cons (nth 2 top) (nth 1 top)) acc)))
     acc))
 
+(defun nelisp-cfront-lower--collect-func-params (program)
+  "Alist NAME -> list of param TYPEs (positional) for `func'/`proto'.
+The lone `(void)' marker is dropped; unnamed prototype params are kept
+so positions stay aligned to call arguments."
+  (let ((acc nil))
+    (dolist (top (cdr program))
+      (when (memq (car top) '(func proto))
+        (push (cons (nth 2 top)
+                    (delq nil (mapcar
+                               (lambda (p)
+                                 (let ((ty (nth 1 p)))
+                                   (unless (and (eq (plist-get ty :base) 'void)
+                                                (= 0 (or (plist-get ty :ptr) 0)))
+                                     ty)))
+                               (nth 3 top))))
+              acc)))
+    acc))
+
 ;;; --- expressions -----------------------------------------------------
 
 (defun nelisp-cfront-lower--expr (e)
@@ -439,17 +460,34 @@ matches C, so the raw value is used directly."
                                        (nelisp-cfront-lower--expr rhs)))))))))))
       (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
+(defun nelisp-cfront-lower--call-args (args ptypes)
+  "Lower call ARGS, coercing each to its positional param type in PTYPES
+\(int<->double bits).  Args beyond PTYPES (varargs) pass through as-is."
+  (cl-loop for a in args
+           for i from 0
+           collect (let ((g (nelisp-cfront-lower--expr a))
+                         (pt (nth i ptypes)))
+                     (if pt
+                         (nelisp-cfront-lower--coerce
+                          g (nelisp-cfront-lower--expr-float-p a)
+                          (nelisp-cfront-float-type-p pt))
+                       g))))
+
 (defun nelisp-cfront-lower--call (fn args)
-  (let ((gargs (mapcar #'nelisp-cfront-lower--expr args)))
-    (if (and (eq (car fn) 'var)
-             (nelisp-cfront-lower--var-is-function-p (nth 1 fn)))
-        ;; direct call to a named function
-        (cons (nelisp-cfront-lower--sym (nth 1 fn)) gargs)
-      ;; indirect call through a function-pointer value: fp(...) / (*fp)(...)
-      (let ((target (if (and (eq (car fn) 'unop) (string= (nth 1 fn) "*"))
-                        (nth 2 fn)
-                      fn)))
-        (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs))))))
+  (if (and (eq (car fn) 'var)
+           (nelisp-cfront-lower--var-is-function-p (nth 1 fn)))
+      ;; direct call to a named function: coerce args to the param types
+      (let* ((name (nth 1 fn))
+             (ptypes (cdr (assoc name nelisp-cfront-lower--func-params))))
+        (cons (nelisp-cfront-lower--sym name)
+              (nelisp-cfront-lower--call-args args ptypes)))
+    ;; indirect call through a function-pointer value: fp(...) / (*fp)(...)
+    ;; (param types are not tracked for fn-ptrs; pass args uncoerced)
+    (let ((target (if (and (eq (car fn) 'unop) (string= (nth 1 fn) "*"))
+                      (nth 2 fn)
+                    fn))
+          (gargs (mapcar #'nelisp-cfront-lower--expr args)))
+      (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs)))))
 
 (defun nelisp-cfront-lower--incdec (e)
   "Lower ++/-- (pre or post).  Returns the assigned value (exact for pre
@@ -836,6 +874,7 @@ skipped in the MVP (functions only)."
     (nelisp-cfront-lower--err :not-a-program ast))
   (let ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
         (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
+        (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
         (nelisp-cfront-lower--uses-float nil)
         (funcs nil))
     (dolist (top (cdr ast))
