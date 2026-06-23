@@ -1,0 +1,56 @@
+#+TITLE: Doc 04 — M4 (hard-tail C) status
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-23
+#+STATUS: cfront-layer features DONE; residuals are upstream/relooper
+
+* §0 Summary
+
+M4 ("hard-tail C") is *complete to the extent the nelisp-cfront layer can
+implement it without upstream nelisp-cc grammar additions*.  Every
+hard-tail feature that lowers onto the existing grammar is DONE and
+verified by ERT (52/52, each a real compile→link→run).  The remaining
+items are genuinely NOT cfront-layer work: they need a new nelisp-cc
+grammar op (=alloca= / variadic ABI) or a relooper algorithm.
+
+* §1 DONE (cfront layer, verified runtime-free)
+
+| feature | how | test |
+|---------+-----+------|
+| break / continue | per-loop break flag + guard-lift | loop-test |
+| early-return-in-loop | single-exit return flag | loop-test |
+| function pointers | =addr-of= decay + =call-ptr= indirect | fnptr-test |
+| typedef | parser type-name tracking (scalar/struct/anon) | typedef-test |
+| union | all fields at offset 0, size = max | union-test |
+| fn-ptr declarator | =ret (*fp)(args)= in decl/param/typedef | fnptr-test |
+| forward goto | single top-level cleanup label via goto flag | goto-test |
+| bitfields | LSB-first into 4-byte units, gcc-compatible | bitfield-test |
+
+* §2 Residuals — NOT cfront-layer (need upstream or a relooper)
+
+These cannot be completed inside nelisp-cfront alone:
+
+1. *struct-by-value locals* and *&local* (address of a scalar local) —
+   need an =alloca= / frame-slot-address grammar op in *nelisp-cc*
+   (the nelisp repo).  cfront has no way to give a local a real memory
+   address; frame slots are i64 registers/spill with no exposed address.
+   Workaround today: heap/arena-allocate the struct and use a pointer.
+
+2. *varargs* (=printf=-family) — needs the System V AMD64 *variadic
+   calling convention* (register save area, =al= = #SSE regs) in
+   *nelisp-cc*.  Upstream grammar/ABI work.
+
+3. *general / backward goto* — needs a *relooper* (CFG → structured
+   control flow) algorithm.  Large, but cfront-layer; the common forward
+   cleanup case is already handled (§1).
+
+4. *native =u16/u32= memory ops* — functionally complete via u8
+   composition (Stage 2 / M2.3); native ops would be a perf-only
+   grammar addition in nelisp-cc.
+
+* §3 Decision
+
+The cfront layer's M4 is complete.  Closing the residuals means choosing:
+- add =alloca= + variadic-ABI grammar ops to *nelisp-cc* (upstream), and/or
+- implement a relooper in cfront for general goto.
+Both are substantial and orthogonal to cfront's lowering layer; they are
+tracked here rather than left implicit.
