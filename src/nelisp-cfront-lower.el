@@ -143,12 +143,50 @@ names stay literal — the linker needs the original C symbol.)"
        `(+ ,(nelisp-cfront-lower--addr (nth 1 e)) ,(plist-get fld :offset))))
     (_ (nelisp-cfront-lower--err :not-an-lvalue e))))
 
+(defun nelisp-cfront-lower--field-of (e)
+  "Return the field plist (:type :offset :size [:bits :bit-offset]) for an
+arrow/member lvalue E, or nil."
+  (pcase (car e)
+    ((or 'arrow 'member)
+     (let ((sname (plist-get (nelisp-cfront-lower--type-of (nth 1 e)) :struct)))
+       (and sname (ignore-errors
+                    (nelisp-cfront-type-field sname (nth 2 e)
+                                              nelisp-cfront-lower--structs)))))
+    (_ nil)))
+
+(defun nelisp-cfront-lower--bitfield-assign (lhs op grhs fld)
+  "Lower an assignment to bitfield LHS: read unit, clear bits, OR in value."
+  (let* ((addr (nelisp-cfront-lower--addr lhs))
+         (bo (plist-get fld :bit-offset))
+         (w (plist-get fld :bits))
+         (mask (1- (ash 1 w)))
+         (clear (logand (lognot (ash mask bo)) #xFFFFFFFF))
+         (newval (if (string= op "=")
+                     grhs
+                   (let* ((bop (substring op 0 (1- (length op))))
+                          (g (cdr (assoc bop nelisp-cfront-lower--binop-map)))
+                          (cur `(logand (sar ,(nelisp-cfront-lower--load-w addr 4) ,bo) ,mask)))
+                     (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                     (list g cur grhs)))))
+    (nelisp-cfront-lower--store-w
+     addr 4
+     `(logior (logand ,(nelisp-cfront-lower--load-w addr 4) ,clear)
+              (shl (logand ,newval ,mask) ,bo)))))
+
 (defun nelisp-cfront-lower--load-lvalue (e)
-  "Load the value of memory lvalue E using its type width."
-  (nelisp-cfront-lower--load-w
-   (nelisp-cfront-lower--addr e)
-   (nelisp-cfront-type-size (nelisp-cfront-lower--type-of e)
-                            nelisp-cfront-lower--structs)))
+  "Load the value of memory lvalue E (bitfield-aware)."
+  (let ((fld (nelisp-cfront-lower--field-of e)))
+    (if (and fld (plist-get fld :bits))
+        ;; bitfield read: (unit >> bit-offset) & ((1<<bits)-1)
+        (let ((mask (1- (ash 1 (plist-get fld :bits)))))
+          `(logand (sar ,(nelisp-cfront-lower--load-w
+                          (nelisp-cfront-lower--addr e) 4)
+                        ,(plist-get fld :bit-offset))
+                   ,mask))
+      (nelisp-cfront-lower--load-w
+       (nelisp-cfront-lower--addr e)
+       (nelisp-cfront-type-size (nelisp-cfront-lower--type-of e)
+                                nelisp-cfront-lower--structs)))))
 
 ;;; --- collect mutable locals (for the outer frame-slot let) -----------
 
@@ -269,16 +307,19 @@ matches C, so the raw value is used directly."
              (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
              `(setq ,name (,g ,name ,grhs))))))
       ((or 'unop 'index 'arrow 'member)        ; memory lvalue: *p / a[i] / p->f / s.f
-       (let ((addr (nelisp-cfront-lower--addr lhs))
-             (width (nelisp-cfront-type-size (nelisp-cfront-lower--type-of lhs)
-                                             nelisp-cfront-lower--structs)))
-         (if (string= op "=")
-             (nelisp-cfront-lower--store-w addr width grhs)
-           (let* ((bop (substring op 0 (1- (length op))))
-                  (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
-             (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
-             (nelisp-cfront-lower--store-w
-              addr width (list g (nelisp-cfront-lower--load-w addr width) grhs))))))
+       (let ((fld (nelisp-cfront-lower--field-of lhs)))
+         (if (and fld (plist-get fld :bits))
+             (nelisp-cfront-lower--bitfield-assign lhs op grhs fld)
+           (let ((addr (nelisp-cfront-lower--addr lhs))
+                 (width (nelisp-cfront-type-size (nelisp-cfront-lower--type-of lhs)
+                                                 nelisp-cfront-lower--structs)))
+             (if (string= op "=")
+                 (nelisp-cfront-lower--store-w addr width grhs)
+               (let* ((bop (substring op 0 (1- (length op))))
+                      (g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+                 (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
+                 (nelisp-cfront-lower--store-w
+                  addr width (list g (nelisp-cfront-lower--load-w addr width) grhs))))))))
       (_ (nelisp-cfront-lower--err :unsupported-assign-target lhs)))))
 
 (defun nelisp-cfront-lower--call (fn args)

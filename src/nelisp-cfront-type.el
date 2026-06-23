@@ -75,22 +75,35 @@
 (defun nelisp-cfront-type--round-up (n a) (* (/ (+ n a -1) a) a))
 
 (defun nelisp-cfront-type-layout (fields structs &optional union-p)
-  "Compute layout for struct/union FIELDS (a list of (field TY NAME)).
+  "Compute layout for struct/union FIELDS (a list of (field TY NAME BITS)).
 When UNION-P, every field is at offset 0 and size = max field size.
+Bitfields (BITS non-nil) pack LSB-first into 4-byte units (no straddling).
 Returns (:size N :align A :fields ALIST)."
-  (let ((off 0) (align 1) (maxsz 0) (alist nil))
+  (let ((off 0) (align 1) (maxsz 0) (alist nil)
+        (bf-unit nil) (bf-cursor 0))
     (dolist (f fields)
-      (let* ((ty (nth 1 f)) (name (nth 2 f))
-             (sz (nelisp-cfront-type-size ty structs))
-             (al (nelisp-cfront-type-align ty structs)))
-        (if union-p
-            (progn
-              (push (cons name (list :type ty :offset 0 :size sz)) alist)
-              (setq maxsz (max maxsz sz)))
-          (setq off (nelisp-cfront-type--round-up off al))
-          (push (cons name (list :type ty :offset off :size sz)) alist)
-          (setq off (+ off sz)))
-        (setq align (max align al))))
+      (let* ((ty (nth 1 f)) (name (nth 2 f)) (bits (nth 3 f)))
+        (cond
+         (bits                          ; --- bitfield ---
+          (when (or (null bf-unit) (> (+ bf-cursor bits) 32))
+            (setq off (nelisp-cfront-type--round-up off 4)
+                  bf-unit off off (+ off 4) bf-cursor 0 align (max align 4)))
+          (push (cons name (list :type ty :offset bf-unit :size 4
+                                 :bit-offset bf-cursor :bits bits)) alist)
+          (setq bf-cursor (+ bf-cursor bits)))
+         (union-p                       ; --- union member ---
+          (setq bf-unit nil bf-cursor 0)
+          (let ((sz (nelisp-cfront-type-size ty structs)))
+            (push (cons name (list :type ty :offset 0 :size sz)) alist)
+            (setq maxsz (max maxsz sz)
+                  align (max align (nelisp-cfront-type-align ty structs)))))
+         (t                             ; --- normal struct member ---
+          (setq bf-unit nil bf-cursor 0)
+          (let ((sz (nelisp-cfront-type-size ty structs))
+                (al (nelisp-cfront-type-align ty structs)))
+            (setq off (nelisp-cfront-type--round-up off al))
+            (push (cons name (list :type ty :offset off :size sz)) alist)
+            (setq off (+ off sz) align (max align al)))))))
     (list :size (nelisp-cfront-type--round-up (if union-p maxsz off) align)
           :align align
           :fields (nreverse alist))))

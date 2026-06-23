@@ -150,15 +150,24 @@
   (let ((fields nil))
     (while (not (nelisp-cfront-parse--at-punct "}"))
       (let* ((fty (nelisp-cfront-parse--parse-type))
-             (fname (nelisp-cfront-parse--eat-ident)))
-        ;; optional array field: TYPE NAME[N]
-        (when (nelisp-cfront-parse--at-punct "[")
+             (fname (nelisp-cfront-parse--eat-ident))
+             (bits nil))
+        (cond
+         ;; bitfield: TYPE NAME : WIDTH
+         ((nelisp-cfront-parse--at-punct ":")
+          (nelisp-cfront-parse--advance)
+          (let ((w (nelisp-cfront-parse--parse-expr)))
+            (unless (eq (car w) 'int)
+              (signal 'nelisp-cfront-parse-error (list :non-constant-bitfield-width w)))
+            (setq bits (nth 1 w))))
+         ;; array field: TYPE NAME[N]
+         ((nelisp-cfront-parse--at-punct "[")
           (nelisp-cfront-parse--advance)
           (let ((sz (nelisp-cfront-parse--parse-expr)))
             (nelisp-cfront-parse--eat-punct "]")
-            (setq fty (append fty (list :array sz)))))
+            (setq fty (append fty (list :array sz))))))
         (nelisp-cfront-parse--eat-punct ";")
-        (push (list 'field fty fname) fields)))
+        (push (list 'field fty fname bits) fields)))
     (nelisp-cfront-parse--eat-punct "}")
     (nreverse fields)))
 

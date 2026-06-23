@@ -6,8 +6,9 @@ EMACS ?= emacs
 NELISP_REPO_ROOT ?= ../nelisp
 export NELISP_REPO_ROOT
 
-# Load-path: this repo's src + nelisp lisp/src.
+# Load-path: this repo's src + test (helpers) + nelisp lisp/src.
 LOADPATH = -L src \
+           -L test \
            -L $(NELISP_REPO_ROOT)/lisp \
            -L $(NELISP_REPO_ROOT)/src
 
@@ -27,7 +28,7 @@ help:
 
 test:
 	$(EMACS) -Q --batch $(LOADPATH) \
-	  --eval '(dolist (f (directory-files "test" t "-test\\.el$$")) (load f))' \
+	  --eval '(dolist (f (directory-files "test" t "-test\\.el$$")) (require (intern (file-name-base f))))' \
 	  -f ert-run-tests-batch-and-exit
 
 compile:
