@@ -210,6 +210,23 @@ FROM-FLOAT-P / TO-FLOAT-P flags."
              (ptr-write-u8 ,addr 3 (logand (sar ,val 24) 255))))
     (_ (nelisp-cfront-lower--err :unsupported-store-width width))))
 
+(defun nelisp-cfront-lower--copy-bytes (dst src n)
+  "Lower a struct/array by-value copy of N bytes from address SRC to DST.
+DST and SRC are evaluated once (into fresh frame temps) then copied in
+descending word widths (u64/u32/u16/u8) at constant offsets."
+  (let ((d (nelisp-cfront-lower--gensym "cpd"))
+        (s (nelisp-cfront-lower--gensym "cps"))
+        (forms nil) (off 0))
+    (while (<= (+ off 8) n)
+      (push `(ptr-write-u64 ,d ,off (ptr-read-u64 ,s ,off)) forms) (setq off (+ off 8)))
+    (while (<= (+ off 4) n)
+      (push `(ptr-write-u32 ,d ,off (ptr-read-u32 ,s ,off)) forms) (setq off (+ off 4)))
+    (while (<= (+ off 2) n)
+      (push `(ptr-write-u16 ,d ,off (ptr-read-u16 ,s ,off)) forms) (setq off (+ off 2)))
+    (while (<= (+ off 1) n)
+      (push `(ptr-write-u8 ,d ,off (ptr-read-u8 ,s ,off)) forms) (setq off (+ off 1)))
+    `(let ((,d ,dst) (,s ,src)) ,(nelisp-cfront-lower--seq (nreverse forms)))))
+
 (defun nelisp-cfront-lower--elem-size (ptr-expr)
   "Element size of the pointee/array element of PTR-EXPR's type."
   (nelisp-cfront-type-size
@@ -285,6 +302,15 @@ arrow/member lvalue E, or nil."
        (nelisp-cfront-lower--addr e)
        (nelisp-cfront-type-size (nelisp-cfront-lower--type-of e)
                                 nelisp-cfront-lower--structs)))))
+
+(defun nelisp-cfront-lower--rvalue (e)
+  "Lower memory lvalue E in rvalue (value) context.
+Aggregate lvalues (a C array or struct/union value) *decay* to their
+address — `a[i]', `s.f', `&s.f', struct copy all consume that address —
+so we never try to load a whole struct/array.  Scalars are loaded."
+  (if (nelisp-cfront-lower--aggregate-type-p (nelisp-cfront-lower--type-of e))
+      (nelisp-cfront-lower--addr e)
+    (nelisp-cfront-lower--load-lvalue e)))
 
 ;;; --- collect mutable locals (for the outer frame-slot let) -----------
 
@@ -365,14 +391,14 @@ so positions stay aligned to call arguments."
     ('str (nelisp-cfront-lower--err :string-literal-unsupported e)) ; needs rodata
     ('binop (nelisp-cfront-lower--binop (nth 1 e) (nth 2 e) (nth 3 e)))
     ('unop (if (string= (nth 1 e) "*")
-               (nelisp-cfront-lower--load-lvalue e)   ; typed deref
+               (nelisp-cfront-lower--rvalue e)   ; typed deref (aggregate decays)
              (nelisp-cfront-lower--unop (nth 1 e) (nth 2 e))))
     ('assign (nelisp-cfront-lower--assign (nth 1 e) (nth 2 e) (nth 3 e)))
     ('call (nelisp-cfront-lower--call (nth 1 e) (nth 2 e)))
     ('ternary `(if ,(nelisp-cfront-lower--cond (nth 1 e))
                    ,(nelisp-cfront-lower--expr (nth 2 e))
                  ,(nelisp-cfront-lower--expr (nth 3 e))))
-    ('index (nelisp-cfront-lower--load-lvalue e))      ; typed element load
+    ('index (nelisp-cfront-lower--rvalue e))      ; element load (aggregate decays)
     ('sizeof (nelisp-cfront-lower--sizeof (nth 1 e)))
     ('sizeof-expr (nelisp-cfront-type-size (nelisp-cfront-lower--type-of (nth 1 e))
                                            nelisp-cfront-lower--structs))
@@ -386,7 +412,7 @@ so positions stay aligned to call arguments."
     ('comma (nelisp-cfront-lower--seq (list (nelisp-cfront-lower--expr (nth 1 e))
                                             (nelisp-cfront-lower--expr (nth 2 e)))))
     ((or 'pre 'post) (nelisp-cfront-lower--incdec e))
-    ((or 'member 'arrow) (nelisp-cfront-lower--load-lvalue e))
+    ((or 'member 'arrow) (nelisp-cfront-lower--rvalue e))   ; aggregate decays
     (_ (nelisp-cfront-lower--err :unsupported-expr e))))
 
 (defun nelisp-cfront-lower--binop (op l r)
@@ -468,6 +494,19 @@ matches C, so the raw value is used directly."
     (_ nil)))
 
 (defun nelisp-cfront-lower--assign (op lhs rhs)
+  (if (and (string= op "=")
+           (nelisp-cfront-lower--aggregate-type-p (nelisp-cfront-lower--type-of lhs)))
+      ;; struct/array by-value copy: copy sizeof(lhs) bytes from rhs's
+      ;; address to lhs's address (rhs must be an lvalue — a struct-
+      ;; returning call is struct-return ABI, deferred).
+      (nelisp-cfront-lower--copy-bytes
+       (nelisp-cfront-lower--addr lhs)
+       (nelisp-cfront-lower--addr rhs)
+       (nelisp-cfront-type-size (nelisp-cfront-lower--type-of lhs)
+                                nelisp-cfront-lower--structs))
+    (nelisp-cfront-lower--assign-scalar op lhs rhs)))
+
+(defun nelisp-cfront-lower--assign-scalar (op lhs rhs)
   (let* ((lhs-float (nelisp-cfront-lower--expr-float-p lhs))
          ;; RHS value coerced to the LHS class (int<->double bits) for `='
          (grhs (nelisp-cfront-lower--coerce
@@ -734,8 +773,16 @@ Only a single top-level forward label (the cleanup pattern) is supported."
   (pcase (car s)
     ('decl (let ((init (nth 3 s)) (cname (nth 2 s)) (ty (nth 1 s)))
              (cond
-              ;; uninitialised, or aggregate init (local array/struct deferred)
+              ;; uninitialised, or aggregate init list (local array/struct
+              ;; `{...}' init deferred)
               ((or (null init) (and (consp init) (eq (car init) 'init-list))) 0)
+              ;; aggregate copy-init: `struct T x = lvalue;' / `T a = b;'
+              ;; copies sizeof(ty) bytes from the initializer's address.
+              ((nelisp-cfront-lower--aggregate-type-p ty)
+               (nelisp-cfront-lower--copy-bytes
+                (nelisp-cfront-lower--lvar cname)
+                (nelisp-cfront-lower--addr init)
+                (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)))
               ;; address-taken scalar: store the initializer through the
               ;; frame-alloc block pointer (the slot holds the address).
               ((nelisp-cfront-lower--mem-var-scalar-p cname)

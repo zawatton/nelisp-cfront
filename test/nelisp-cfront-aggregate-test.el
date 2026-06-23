@@ -72,6 +72,38 @@ int main(void){
     (should (equal "14 42 42 42" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-aggregate-array-member-and-struct-copy-e2e ()
+  "Array-typed struct members decay to their address (so `c->lim[i]'
+indexes rather than loading the whole array), and struct-by-value copy
+\(`b = a;') memcpys.  These are the dominant lowering cases behind the
+former :unsupported-load-width bucket."
+  (unless (nelisp-cfront-aggregate-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-aggregate-test--run "
+struct Cfg { int lim[12]; int n; };
+struct Pt { int x; int y; };
+int getlim(struct Cfg *c, int i){ return c->lim[i]; }
+void setlim(struct Cfg *c, int i, int v){ c->lim[i] = v; }
+int copypt(void){ struct Pt a; struct Pt b; a.x = 10; a.y = 32; b = a; return b.x + b.y; }
+int sumcfg(struct Cfg *c){ int s = 0; int i; for (i = 0; i < c->n; i = i + 1) s += c->lim[i]; return s; }
+" "
+#include <stdio.h>
+struct Cfg { int lim[12]; int n; };
+extern int getlim(struct Cfg*, int);
+extern void setlim(struct Cfg*, int, int);
+extern int copypt(void);
+extern int sumcfg(struct Cfg*);
+int main(void){
+  struct Cfg c; c.n = 4;
+  for(int i=0;i<4;i++) setlim(&c,i,i*10);
+  int g=getlim(&c,3), s=sumcfg(&c), p=copypt();
+  printf(\"%d %d %d\\n\", g, s, p);
+  return (g==30 && s==60 && p==42)?0:1;
+}
+")))
+    (should (equal "30 60 42" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-aggregate-test)
 
 ;;; nelisp-cfront-aggregate-test.el ends here

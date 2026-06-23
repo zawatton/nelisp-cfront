@@ -369,3 +369,27 @@ dimension — needs parse-deferred dim evaluation.)
 After this, the dominant bucket is =:unsupported-load-width= (388 —
 struct-by-value loads), the natural next lowering target.
 
+** §10.2 =:unsupported-load-width= crushed (388 → 0; coverage 55% → 65%)
+
+The width came from trying to *load a whole aggregate value*.  Root cause
+was that an array-/struct-typed member, index, or deref in rvalue context
+went through =--load-lvalue=, e.g. =db->aLimit[0]= where =aLimit= is
+=int aLimit[12]=: lowering =db->aLimit= tried to load the 48-byte array
+before indexing it.
+
+Fix — the same "aggregate decays to its address" rule already used for
+*vars*, now applied to member / arrow / index / deref via a new
+=--rvalue=: an aggregate lvalue yields its *address* (which =a[i]=, =s.f=,
+=&=, struct copy all consume), a scalar is loaded.  Plus genuine struct
+*copy* (=b = a=, =struct T x = lvalue;=) now lowers to a word-wise
+=--copy-bytes= (u64/u32/u16/u8 at constant offsets) instead of a scalar
+load/store.
+
+Result: =:unsupported-load-width= 388 → *0*; coverage 55.2% → *64.9%*
+(1,553 / 2,392 functions).  Verified e2e: =getlim/sumcfg= (array-member
+indexing through a pointer) and =copypt= (=b = a= struct copy) =30 60 42=.
+
+The dominant bucket is now =:string-literal-unsupported= (244 — needs an
+object-mode rodata string pool), then =:incdec-needs-var= (174 — lvalue
+=++=/=--=).
+
