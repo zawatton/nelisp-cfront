@@ -123,7 +123,7 @@
          (t (push w specs)))))
     (let* ((specs (nreverse specs))
            (base (cond
-                  (struct-name 'struct)
+                  ((or struct-name struct-fields) 'struct)  ; tagged or anonymous
                   ((member "long" specs) 'long)
                   ((member "short" specs) 'short)
                   ((member "char" specs) 'char)
