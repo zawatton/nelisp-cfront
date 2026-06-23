@@ -56,16 +56,33 @@ reference (the existing =data-addr= is for *external* symbols only).
 
 * §3 Plan (layered; re-measure with =make lower-gap= after each step)
 
-** Step A — upstream keystone: same-unit data definition + address
-Add to =nelisp-aot-compiler.el= (ET_REL path) two grammar ops:
-- =(data-blob NAME BYTES SECTION)= — emit BYTES into =.rodata= (or
-  =.data=/=.bss=) and define a local symbol NAME at its offset.
-- =(data-addr-local NAME)= — load NAME's address into rax via a PC32 (or
-  abs64) relocation against the local symbol.
-This is the real work, but rides the existing =nelisp-elf-write= data /
-symtab / reloc machinery.  Verify like f64-bits / frame-alloc: emit a
-blob + a function returning =data-addr-local=, link with a C driver,
-read the bytes back.
+** Step A — upstream keystone: same-unit data definition + address  [DONE 2026-06-24]
+Added to =nelisp-aot-compiler.el= (ET_REL path):
+- =(data-blob NAME BYTES SECTION)= — opcode 102 — emit BYTES (a unibyte
+  string or list of 0-255 ints) into =.rodata= and define a LOCAL OBJECT
+  symbol NAME (a symbol) at its offset.  Statement-only declaration; emits
+  no =.text=.  Parsed in =--parse-stmt=; collected by
+  =--collect-data-blobs=; wired into =compile-to-link-unit= (blob bytes
+  appended to =.rodata=, =blob-symbols= added to =all-symbols=, blob names
+  removed from =extern-names=).
+- *No separate =data-addr-local= op was needed.*  The existing
+  =(data-addr NAME)= already emits =LEA rax,[rip+disp32]= + a PC32 reloc;
+  since =data-blob= registers NAME as a LOCAL defined symbol and filters it
+  out of =extern-names=, =data-addr= resolves against the local blob symbol
+  automatically.
+Two gating fixes were required so the form survives object mode:
+- =data-blob= added to =--external-user-call-reserved-ops= (so the
+  =parse-value= extern-call fallback never intercepts it), and
+- =data-blob= added to the keep-list in =--extract-defmacros= seq handling
+  (line ~2166); under =--allow-external-user-calls t= that arm was
+  *dropping* every non-=defun=/=prog1= symbol-headed top-level child, which
+  silently deleted the blob from =:source=.  This was the real blocker.
+
+Verified end-to-end (=nelisp-aot-compiler/data-blob-*= ERT tests): a blob
++ two reader defuns compile to an ET_REL =.o= where =readelf= shows
+=myblob= as =OBJECT LOCAL= in =.rodata= with two =R_X86_64_PC32= relocs; a
+C driver links and reads the exact bytes back
+(=getb(0)=10 getb(4)=250 getb(7)=200 getword(0)=0x281e140a=).
 
 ** Step B — cfront: read-only integer global arrays (the =:deref= bucket)
 - Parser: retain global array initializer values (const-fold the
