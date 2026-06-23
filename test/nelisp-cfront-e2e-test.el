@@ -125,6 +125,34 @@ int main(void){
     (should (equal "25 150 3 4 600 100 200 300" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-e2e-ternary-comma-then ()
+  "Ternary THEN arm with a comma operator: `c ? (x=v),1 : e' (the
+SQLite putVarint idiom).  The C grammar makes the THEN arm a full
+expression, so the comma is part of it; it must evaluate the assignment
+for effect then yield the post-comma value."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+int put(int *slot, int v){
+  int n = ((unsigned)v < 0x80) ? ((*slot = v),1) : 2;
+  return n;
+}
+")
+         (drv "
+#include <stdio.h>
+extern int put(int*,int);
+int main(void){
+  int s1=0, s2=0;
+  int n1 = put(&s1, 5);    /* cond true -> s1=5, n=1 */
+  int n2 = put(&s2, 200);  /* cond false -> n=2, s2 untouched */
+  printf(\"%d %d %d %d\\n\", n1, s1, n2, s2);
+  return (n1==1 && s1==5 && n2==2 && s2==0)?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "1 5 2 0" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-e2e-test)
 
 ;;; nelisp-cfront-e2e-test.el ends here

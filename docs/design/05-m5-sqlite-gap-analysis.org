@@ -116,13 +116,21 @@ advances as features land:
 | string concatenation | 13662 | ="a" "b"= |
 | anon aggregate member | 19571 | =union { ... };= in a struct |
 | local struct def | 24756 | =struct S {..};= inside a function |
-| *current* | *24756* | next: a deeply-nested ternary/comma expr |
+| ternary-comma THEN | 79904 | =c ? (x=v),1 : f()= (putVarint idiom) |
+| block-scope typedef | *DONE* | =typedef ...;= inside a function body |
+| *FULL PARSE* | — | *all 84,092 lines parse* |
 
-So *~24,700 of 84,092 lines (≈29%)* of real preprocessed sqlite3.c now
-parse.  The remaining tail is more function-body expression/statement
-forms, then the *lowering* gaps (float arithmetic via f64 grammar ops,
-enum-constant registration, aggregate/array-local storage) and the Tier-3
-upstream items (varargs ABI, alloca).  Continue with =make gap=.
+*The entire preprocessed =sqlite3.c= now parses* — 6,840 top-level forms
+(2,392 functions, 3,618 prototypes, 462 typedefs, 251 struct defs, 117
+globals).  Two final fixes took it from ≈29% to 100%: the ternary THEN
+arm is a full *expression* (allows the comma operator — the pervasive
+=getVarint=/=putVarint= macro idiom), and block-scope =typedef= (inside a
+function body).  cfront's *front-end* is complete for real SQLite.
+
+What remains is *lowering*, not parsing: most of §6-9 (float, enum,
+aggregate locals) is done; the open items are varargs (Doc 05 §9.4),
+aggregate initializers, struct copy, address-taken params, and the
+external double ABI shim.  Run =make gap= to re-confirm full parse.
 
 * §6 Float lowering — SOLVED via "soft-float in the i64 world"
 

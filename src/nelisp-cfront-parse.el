@@ -462,7 +462,12 @@ arrays), so this is parse-only for now."
     (if (nelisp-cfront-parse--at-punct "?")
         (progn
           (nelisp-cfront-parse--advance)
-          (let ((a (nelisp-cfront-parse--parse-assign)))
+          ;; C grammar: `cond ? EXPRESSION : conditional-expression'.  The
+          ;; THEN arm is a full expression — it may contain the comma
+          ;; operator (e.g. `c ? (x=v),1 : f()'), so parse it with
+          ;; `--parse-expr', not `--parse-assign'.  The ELSE arm is a
+          ;; conditional-expression (no top-level comma).
+          (let ((a (nelisp-cfront-parse--parse-expr)))
             (nelisp-cfront-parse--eat-punct ":")
             (list 'ternary c a (nelisp-cfront-parse--parse-assign))))
       c)))
@@ -599,6 +604,9 @@ arrays), so this is parse-only for now."
    ((nelisp-cfront-parse--at-punct ";")        ; empty statement
     (nelisp-cfront-parse--advance) (list 'block))
    ((nelisp-cfront-parse--at-punct "{") (nelisp-cfront-parse--parse-block))
+   ((nelisp-cfront-parse--at-kw "typedef")      ; block-scope typedef
+    (nelisp-cfront-parse--parse-typedef)        ; register the alias
+    (list 'block))                              ; no runtime effect
    ((nelisp-cfront-parse--at-kw "if")
     (nelisp-cfront-parse--advance)
     (nelisp-cfront-parse--eat-punct "(")
