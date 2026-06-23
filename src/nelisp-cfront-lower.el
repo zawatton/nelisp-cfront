@@ -560,6 +560,7 @@ skipped in the MVP (functions only)."
         ('proto nil)                          ; ignore prototypes
         ('global nil)                         ; MVP: globals deferred
         ('struct-def nil)                     ; layout already in the table
+        ('typedef nil)                        ; aliases resolved during parse
         (_ (nelisp-cfront-lower--err :unsupported-toplevel top))))
     (cons 'seq
           (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)

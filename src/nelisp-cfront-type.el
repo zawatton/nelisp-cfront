@@ -95,10 +95,17 @@ Returns (:size N :align A :fields ALIST)."
 Also scans inline `:fields' on struct types in params/decls."
   (let ((structs nil))
     (dolist (top (cdr program))
-      (when (eq (car top) 'struct-def)
-        (let ((name (nth 1 top)) (fields (nth 2 top)))
-          (when (and name fields)
-            (push (cons name (nelisp-cfront-type-layout fields structs)) structs)))))
+      (pcase (car top)
+        ('struct-def
+         (let ((name (nth 1 top)) (fields (nth 2 top)))
+           (when (and name fields)
+             (push (cons name (nelisp-cfront-type-layout fields structs)) structs))))
+        ('typedef
+         (let* ((ty (nth 2 top)) (name (plist-get ty :struct))
+                (fields (plist-get ty :fields)))
+           (when (and name fields)
+             (push (cons name (nelisp-cfront-type-layout fields structs)) structs))))
+        (_ nil)))
     structs))
 
 (defun nelisp-cfront-type-struct (name structs)

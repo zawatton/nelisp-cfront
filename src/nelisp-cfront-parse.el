@@ -41,6 +41,13 @@
 (defvar nelisp-cfront-parse--toks nil
   "Remaining token list during a parse (dynamically bound).")
 
+(defvar nelisp-cfront-parse--typedefs nil
+  "Alist of typedef NAME -> resolved type plist, accumulated during a parse.")
+
+(defun nelisp-cfront-parse--typedef-lookup (name)
+  "Return the type a typedef NAME resolves to, or nil."
+  (cdr (assoc name nelisp-cfront-parse--typedefs)))
+
 (defconst nelisp-cfront-parse--type-keywords
   '("void" "char" "short" "int" "long" "unsigned" "signed" "const"
     "struct" "static" "extern")
@@ -79,20 +86,38 @@
 ;;; --- types -----------------------------------------------------------
 
 (defun nelisp-cfront-parse--type-start-p ()
-  (and (nelisp-cfront-parse--at 'keyword)
-       (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords)))
+  (or (and (nelisp-cfront-parse--at 'keyword)
+           (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords))
+      (and (nelisp-cfront-parse--at 'ident)
+           (nelisp-cfront-parse--typedef-lookup (nelisp-cfront-parse--pval)))))
 
 (defun nelisp-cfront-parse--parse-type ()
   "Parse a type-specifier sequence + pointer stars into a type plist."
-  (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil))
-    (while (nelisp-cfront-parse--type-start-p)
+  ;; leading storage-class / qualifier keywords
+  (while (and (nelisp-cfront-parse--at 'keyword)
+              (member (nelisp-cfront-parse--pval)
+                      '("const" "static" "extern" "register" "volatile" "inline")))
+    (nelisp-cfront-parse--advance))
+  (if (and (nelisp-cfront-parse--at 'ident)
+           (nelisp-cfront-parse--typedef-lookup (nelisp-cfront-parse--pval)))
+      ;; typedef name -> its resolved type, plus any extra pointer stars
+      (let* ((bt (nelisp-cfront-parse--typedef-lookup
+                  (nth 1 (nelisp-cfront-parse--advance))))
+             (ptr (or (plist-get bt :ptr) 0)))
+        (while (nelisp-cfront-parse--at-punct "*")
+          (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+        (plist-put (copy-sequence bt) :ptr ptr))
+    (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil))
+      (while (and (nelisp-cfront-parse--at 'keyword)
+                  (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords))
       (let ((w (nth 1 (nelisp-cfront-parse--advance))))
         (cond
          ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
          ((string= w "unsigned") (setq unsigned t))
          ((string= w "signed") nil)
          ((string= w "struct")
-          (setq struct-name (nelisp-cfront-parse--eat-ident))
+          (when (nelisp-cfront-parse--at 'ident)         ; tag is optional (anonymous struct)
+            (setq struct-name (nth 1 (nelisp-cfront-parse--advance))))
           (when (nelisp-cfront-parse--at-punct "{")
             (setq struct-fields (nelisp-cfront-parse--parse-struct-body))))
          (t (push w specs)))))
@@ -114,7 +139,7 @@
       (append (list :base base :ptr ptr)
               (when unsigned '(:unsigned t))
               (when struct-name (list :struct struct-name))
-              (when struct-fields (list :fields struct-fields))))))
+              (when struct-fields (list :fields struct-fields)))))))
 
 (defun nelisp-cfront-parse--parse-struct-body ()
   "Parse `{ TYPE NAME; ... }' into a list of (field TYPE NAME)."
@@ -341,8 +366,24 @@
 
 ;;; --- top level -------------------------------------------------------
 
+(defun nelisp-cfront-parse--parse-typedef ()
+  "Parse `typedef <type> <name> ;' and register NAME as a type alias."
+  (nelisp-cfront-parse--advance)                ; consume `typedef'
+  (let* ((ty (nelisp-cfront-parse--parse-type))
+         (name (nelisp-cfront-parse--eat-ident)))
+    (nelisp-cfront-parse--eat-punct ";")
+    ;; anonymous struct typedef: key the layout under the typedef name
+    (when (and (eq (plist-get ty :base) 'struct)
+               (null (plist-get ty :struct))
+               (plist-get ty :fields))
+      (setq ty (plist-put (copy-sequence ty) :struct name)))
+    (push (cons name ty) nelisp-cfront-parse--typedefs)
+    (list 'typedef name ty)))
+
 (defun nelisp-cfront-parse--parse-toplevel ()
-  "Parse a struct definition, function definition, or global declaration."
+  "Parse a typedef, struct definition, function definition, or global decl."
+  (if (nelisp-cfront-parse--at-kw "typedef")
+      (nelisp-cfront-parse--parse-typedef)
   (let ((ty (nelisp-cfront-parse--parse-type)))
     (if (nelisp-cfront-parse--at-punct ";")
         ;; bare type declaration with no declarator: `struct P { ... };'
@@ -366,7 +407,7 @@
               (nelisp-cfront-parse--advance)
               (setq init (nelisp-cfront-parse--parse-assign)))
             (nelisp-cfront-parse--eat-punct ";")
-            (list 'global ty name init)))))))
+            (list 'global ty name init))))))))
 
 (defun nelisp-cfront-parse--parse-params ()
   (let ((params nil))
@@ -399,6 +440,7 @@ string (which is lexed first)."
          (if (stringp tokens-or-source)
              (nelisp-cfront-lex tokens-or-source)
            tokens-or-source))
+        (nelisp-cfront-parse--typedefs nil)
         (tops nil))
     (while (not (nelisp-cfront-parse--at 'eof))
       (push (nelisp-cfront-parse--parse-toplevel) tops))
