@@ -32,6 +32,7 @@
 (defun nelisp-cfront-type--scalar-size (base)
   (pcase base
     ('char 1) ('short 2) ('int 4) ('long 8) ('void 1)
+    ('float 4) ('double 8)
     (_ (signal 'nelisp-cfront-type-error (list :unknown-base base)))))
 
 (defun nelisp-cfront-type-size (ty structs)
@@ -187,6 +188,8 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
          (nelisp-cfront-type-long))))
     ('assign (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('ternary (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
+    ('cast (nth 1 expr))                ; a cast yields the cast-to type
+    ((or 'sizeof 'sizeof-expr) (nelisp-cfront-type-long))
     (_ (nelisp-cfront-type-long))))
 
 (provide 'nelisp-cfront-type)

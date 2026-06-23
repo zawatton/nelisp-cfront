@@ -48,9 +48,57 @@
   "Return the type a typedef NAME resolves to, or nil."
   (cdr (assoc name nelisp-cfront-parse--typedefs)))
 
+(defconst nelisp-cfront-parse--gcc-ignore
+  '("__extension__" "__restrict" "__restrict__" "__inline" "__inline__"
+    "__signed__" "__const" "__volatile__" "__nonnull" "__nothrow__")
+  "GCC-ism identifier tokens dropped wholesale (no args).")
+
+(defconst nelisp-cfront-parse--builtin-typedefs
+  '(("__builtin_va_list" . (:base long :ptr 1))
+    ("__gnuc_va_list"    . (:base long :ptr 1))
+    ("__int128"          . (:base long :ptr 0))
+    ("__int128_t"        . (:base long :ptr 0))
+    ("__uint128_t"       . (:base long :ptr 0 :unsigned t))
+    ("_Float16"  . (:base float :ptr 0))
+    ("_Float32"  . (:base float :ptr 0))
+    ("_Float32x" . (:base double :ptr 0))
+    ("_Float64"  . (:base double :ptr 0))
+    ("_Float64x" . (:base double :ptr 0))
+    ("_Float128" . (:base double :ptr 0))
+    ("_Float128x" . (:base double :ptr 0)))
+  "Pre-registered opaque/extended builtin types so real preprocessed C parses.")
+
+(defun nelisp-cfront-parse--strip-gcc (toks)
+  "Drop GCC-ism tokens from TOKS: `__attribute__((...))', `__extension__',
+`__restrict', `__inline', `__asm__(...)' etc.  Returns a filtered list."
+  (let ((out nil) (rest toks))
+    (while rest
+      (let* ((tk (car rest)) (ty (nth 0 tk)) (v (nth 1 tk)))
+        (cond
+         ;; __attribute__((...)) / __asm__(...) : drop name + balanced parens
+         ((and (eq ty 'ident)
+               (member v '("__attribute__" "__attribute" "__asm__" "__asm")))
+          (setq rest (cdr rest))
+          (when (and rest (eq (nth 0 (car rest)) 'punct)
+                     (string= (nth 1 (car rest)) "("))
+            (let ((depth 0) (done nil))
+              (while (and rest (not done))
+                (let ((x (car rest)))
+                  (when (eq (nth 0 x) 'punct)
+                    (cond ((string= (nth 1 x) "(") (setq depth (1+ depth)))
+                          ((string= (nth 1 x) ")")
+                           (setq depth (1- depth))
+                           (when (= depth 0) (setq done t)))))
+                  (setq rest (cdr rest)))))))
+         ;; bare GCC-ism keywords-as-idents: just drop
+         ((and (eq ty 'ident) (member v nelisp-cfront-parse--gcc-ignore))
+          (setq rest (cdr rest)))
+         (t (push tk out) (setq rest (cdr rest))))))
+    (nreverse out)))
+
 (defconst nelisp-cfront-parse--type-keywords
-  '("void" "char" "short" "int" "long" "unsigned" "signed" "const"
-    "struct" "union" "static" "extern")
+  '("void" "char" "short" "int" "long" "float" "double" "unsigned" "signed"
+    "const" "struct" "union" "enum" "static" "extern" "_Bool")
   "Keywords that may begin / appear in a type-specifier sequence.")
 
 ;;; --- cursor ----------------------------------------------------------
@@ -91,6 +139,14 @@
       (and (nelisp-cfront-parse--at 'ident)
            (nelisp-cfront-parse--typedef-lookup (nelisp-cfront-parse--pval)))))
 
+(defun nelisp-cfront-parse--token-starts-type (tk)
+  "Non-nil when token TK could begin a type-specifier (for cast detection)."
+  (and tk
+       (or (and (eq (nth 0 tk) 'keyword)
+                (member (nth 1 tk) nelisp-cfront-parse--type-keywords))
+           (and (eq (nth 0 tk) 'ident)
+                (nelisp-cfront-parse--typedef-lookup (nth 1 tk))))))
+
 (defun nelisp-cfront-parse--parse-type ()
   "Parse a type-specifier sequence + pointer stars into a type plist."
   ;; leading storage-class / qualifier keywords
@@ -104,8 +160,12 @@
       (let* ((bt (nelisp-cfront-parse--typedef-lookup
                   (nth 1 (nelisp-cfront-parse--advance))))
              (ptr (or (plist-get bt :ptr) 0)))
-        (while (nelisp-cfront-parse--at-punct "*")
-          (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+        (while (or (nelisp-cfront-parse--at-punct "*")
+                   (and (nelisp-cfront-parse--at 'keyword)
+                        (member (nelisp-cfront-parse--pval) '("const" "volatile" "restrict"))))
+          (if (nelisp-cfront-parse--at-punct "*")
+              (progn (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+            (nelisp-cfront-parse--advance)))   ; skip pointer qualifier
         (plist-put (copy-sequence bt) :ptr ptr))
     (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil)
           (is-union nil))
@@ -122,36 +182,74 @@
             (setq struct-name (nth 1 (nelisp-cfront-parse--advance))))
           (when (nelisp-cfront-parse--at-punct "{")
             (setq struct-fields (nelisp-cfront-parse--parse-struct-body))))
+         ((string= w "enum")
+          (when (nelisp-cfront-parse--at 'ident) (nelisp-cfront-parse--advance)) ; tag
+          (when (nelisp-cfront-parse--at-punct "{")      ; skip the { ... } body
+            (nelisp-cfront-parse--advance)
+            (let ((d 1))
+              (while (> d 0)
+                (let ((x (nelisp-cfront-parse--advance)))
+                  (when (eq (nth 0 x) 'punct)
+                    (cond ((string= (nth 1 x) "{") (setq d (1+ d)))
+                          ((string= (nth 1 x) "}") (setq d (1- d)))))))))
+          (push "int" specs))            ; enum is an int
          (t (push w specs)))))
     (let* ((specs (nreverse specs))
            (base (cond
                   ((or struct-name struct-fields) 'struct)  ; tagged or anonymous
+                  ((member "double" specs) 'double)
+                  ((member "float" specs) 'float)
                   ((member "long" specs) 'long)
                   ((member "short" specs) 'short)
                   ((member "char" specs) 'char)
+                  ((member "_Bool" specs) 'char)
                   ((member "int" specs) 'int)
                   ((member "void" specs) 'void)
                   (unsigned 'int)              ; "unsigned" alone => unsigned int
                   (t (signal 'nelisp-cfront-parse-error
                              (list :not-a-type (nelisp-cfront-parse--peek))))))
            (ptr 0))
-      (while (nelisp-cfront-parse--at-punct "*")
-        (nelisp-cfront-parse--advance)
-        (setq ptr (1+ ptr)))
+      (while (or (nelisp-cfront-parse--at-punct "*")
+                 (and (nelisp-cfront-parse--at 'keyword)
+                      (member (nelisp-cfront-parse--pval) '("const" "volatile" "restrict"))))
+        (if (nelisp-cfront-parse--at-punct "*")
+            (progn (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+          (nelisp-cfront-parse--advance)))     ; skip pointer qualifier
       (append (list :base base :ptr ptr)
               (when unsigned '(:unsigned t))
               (when struct-name (list :struct struct-name))
               (when struct-fields (list :fields struct-fields))
               (when is-union '(:union t)))))))
 
+(defun nelisp-cfront-parse--skip-paren-group ()
+  "Skip a balanced `( ... )' group at point (point must be at `(')."
+  (nelisp-cfront-parse--eat-punct "(")
+  (let ((d 1))
+    (while (> d 0)
+      (let ((x (nelisp-cfront-parse--advance)))
+        (cond
+         ((eq (nth 0 x) 'eof) (signal 'nelisp-cfront-parse-error (list :unbalanced-parens)))
+         ((and (eq (nth 0 x) 'punct) (string= (nth 1 x) "(")) (setq d (1+ d)))
+         ((and (eq (nth 0 x) 'punct) (string= (nth 1 x) ")")) (setq d (1- d))))))))
+
+(defun nelisp-cfront-parse--base-type (ty)
+  "Return TY's shared base (drop pointer/array; keep struct/union/unsigned)."
+  (append (list :base (plist-get ty :base) :ptr 0)
+          (when (plist-get ty :unsigned) '(:unsigned t))
+          (when (plist-get ty :struct) (list :struct (plist-get ty :struct)))
+          (when (plist-get ty :union) '(:union t))))
+
 (defun nelisp-cfront-parse--parse-struct-body ()
-  "Parse `{ TYPE NAME; ... }' into a list of (field TYPE NAME)."
+  "Parse `{ TYPE NAME; ... }' into a list of (field TYPE NAME BITS)."
   (nelisp-cfront-parse--eat-punct "{")
   (let ((fields nil))
     (while (not (nelisp-cfront-parse--at-punct "}"))
       (let* ((fty (nelisp-cfront-parse--parse-type))
-             (fname (nelisp-cfront-parse--eat-ident))
-             (bits nil))
+             (fname nil) (bits nil))
+        (if (nelisp-cfront-parse--at-fnptr-declarator)   ; fn-ptr field: ret (*f)(...)
+            (let ((fp (nelisp-cfront-parse--parse-fnptr-name fty)))
+              (setq fty (cdr fp) fname (car fp)))
+          (setq fname (nelisp-cfront-parse--eat-ident)))
         (cond
          ;; bitfield: TYPE NAME : WIDTH
          ((nelisp-cfront-parse--at-punct ":")
@@ -166,8 +264,30 @@
           (let ((sz (nelisp-cfront-parse--parse-expr)))
             (nelisp-cfront-parse--eat-punct "]")
             (setq fty (append fty (list :array sz))))))
-        (nelisp-cfront-parse--eat-punct ";")
-        (push (list 'field fty fname bits) fields)))
+        (push (list 'field fty fname bits) fields)
+        ;; additional comma-separated declarators sharing the base type
+        (let ((base (nelisp-cfront-parse--base-type fty)))
+          (while (nelisp-cfront-parse--at-punct ",")
+            (nelisp-cfront-parse--advance)
+            (let ((ptr 0))
+              (while (nelisp-cfront-parse--at-punct "*")
+                (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+              (if (nelisp-cfront-parse--at-fnptr-declarator)
+                  (let ((fp (nelisp-cfront-parse--parse-fnptr-name base)))
+                    (push (list 'field (cdr fp) (car fp) nil) fields))
+                (let ((nm (nelisp-cfront-parse--eat-ident)) (b2 nil)
+                      (dty (plist-put (copy-sequence base) :ptr ptr)))
+                  (cond
+                   ((nelisp-cfront-parse--at-punct ":")
+                    (nelisp-cfront-parse--advance)
+                    (setq b2 (nth 1 (nelisp-cfront-parse--parse-expr))))
+                   ((nelisp-cfront-parse--at-punct "[")
+                    (nelisp-cfront-parse--advance)
+                    (let ((sz (nelisp-cfront-parse--parse-expr)))
+                      (nelisp-cfront-parse--eat-punct "]")
+                      (setq dty (append dty (list :array sz))))))
+                  (push (list 'field dty nm b2) fields))))))
+        (nelisp-cfront-parse--eat-punct ";")))
     (nelisp-cfront-parse--eat-punct "}")
     (nreverse fields)))
 
@@ -178,23 +298,59 @@
          (and n (eq (nth 0 n) 'punct) (string= (nth 1 n) "*")))))
 
 (defun nelisp-cfront-parse--parse-fnptr-name (ret-ty)
-  "Consume a fn-ptr declarator `(* NAME)(params)' at point.
-Return (cons NAME pointer-type).  The parameter list is skipped (the call
-lowering is type-agnostic); the type is a plain pointer marked :fnptr."
-  (nelisp-cfront-parse--eat-punct "(")
-  (nelisp-cfront-parse--eat-punct "*")
-  (let ((name (nelisp-cfront-parse--eat-ident)))
-    (nelisp-cfront-parse--eat-punct ")")
-    (nelisp-cfront-parse--eat-punct "(")           ; skip the (param-type-list)
-    (let ((depth 1))
-      (while (> depth 0)
-        (let ((tk (nelisp-cfront-parse--advance)))
-          (cond
-           ((and (eq (nth 0 tk) 'punct) (string= (nth 1 tk) "(")) (setq depth (1+ depth)))
-           ((and (eq (nth 0 tk) 'punct) (string= (nth 1 tk) ")")) (setq depth (1- depth)))
-           ((eq (nth 0 tk) 'eof)
-            (signal 'nelisp-cfront-parse-error (list :unterminated-fnptr-params)))))))
+  "Consume a (possibly nested) function-pointer declarator at point, e.g.
+`(* NAME)(params)' or `(*(*NAME)(p))(void)'.  Balanced-paren scan: grab the
+first identifier as NAME (the declared name is the leftmost ident), consume
+the whole declarator (trailing `(...)' / `[...]' groups).  Return
+\(cons NAME pointer-type); the type is a plain pointer marked :fnptr."
+  (let ((name nil) (depth 0) (done nil))
+    (while (and (not done) nelisp-cfront-parse--toks)
+      (let* ((tk (nelisp-cfront-parse--advance)) (ty (nth 0 tk)) (v (nth 1 tk)))
+        (cond
+         ((eq ty 'eof) (signal 'nelisp-cfront-parse-error (list :unterminated-declarator)))
+         ((and (eq ty 'punct) (string= v "(")) (setq depth (1+ depth)))
+         ((and (eq ty 'punct) (string= v "["))  ; array group inside declarator
+          (let ((d 1)) (while (> d 0)
+                         (let ((x (nelisp-cfront-parse--advance)))
+                           (when (eq (nth 0 x) 'punct)
+                             (cond ((string= (nth 1 x) "[") (setq d (1+ d)))
+                                   ((string= (nth 1 x) "]") (setq d (1- d)))))))))
+         ((and (eq ty 'punct) (string= v ")"))
+          (setq depth (1- depth))
+          (when (<= depth 0)
+            ;; declarator core/group closed: continue only if another
+            ;; (params) or [dims] group follows, else the declarator is done
+            (unless (or (nelisp-cfront-parse--at-punct "(")
+                        (nelisp-cfront-parse--at-punct "["))
+              (setq done t))))
+         ((eq ty 'ident) (unless name (setq name v))))))
+    ;; NAME may be nil for an unnamed fn-ptr param, e.g. `int (*)(void)'
     (cons name (list :base (or (plist-get ret-ty :base) 'long) :ptr 1 :fnptr t))))
+
+(defun nelisp-cfront-parse--parse-initializer ()
+  "Parse an initializer: a brace aggregate `{ ... }' (incl. designated
+`.f =' / `[i] =') or a scalar assignment-expression.  Aggregates return
+`(init-list ELT...)'; lowering of aggregates is deferred (globals/locals
+arrays), so this is parse-only for now."
+  (if (nelisp-cfront-parse--at-punct "{")
+      (progn
+        (nelisp-cfront-parse--advance)
+        (let ((elts nil))
+          (while (not (nelisp-cfront-parse--at-punct "}"))
+            ;; optional designators: .field = ...  or  [index] = ...
+            (while (or (nelisp-cfront-parse--at-punct ".")
+                       (nelisp-cfront-parse--at-punct "["))
+              (if (nelisp-cfront-parse--at-punct ".")
+                  (progn (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-ident))
+                (nelisp-cfront-parse--advance)
+                (nelisp-cfront-parse--parse-expr)
+                (nelisp-cfront-parse--eat-punct "]"))
+              (when (nelisp-cfront-parse--at-punct "=") (nelisp-cfront-parse--advance)))
+            (push (nelisp-cfront-parse--parse-initializer) elts)
+            (when (nelisp-cfront-parse--at-punct ",") (nelisp-cfront-parse--advance)))
+          (nelisp-cfront-parse--eat-punct "}")
+          (cons 'init-list (nreverse elts))))
+    (nelisp-cfront-parse--parse-assign)))
 
 ;;; --- expressions (precedence climbing) -------------------------------
 
@@ -252,6 +408,14 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
 (defun nelisp-cfront-parse--parse-unary ()
   (let ((tk (nelisp-cfront-parse--peek)))
     (cond
+     ;; cast: ( TYPE ) unary   (disambiguated from a parenthesised expr by
+     ;; the token after `(' starting a type)
+     ((and (eq (nth 0 tk) 'punct) (string= (nth 1 tk) "(")
+           (nelisp-cfront-parse--token-starts-type (cadr nelisp-cfront-parse--toks)))
+      (nelisp-cfront-parse--advance)
+      (let ((ty (nelisp-cfront-parse--parse-type)))
+        (nelisp-cfront-parse--eat-punct ")")
+        (list 'cast ty (nelisp-cfront-parse--parse-unary))))
      ((and (eq (nth 0 tk) 'punct) (member (nth 1 tk) '("++" "--")))
       (nelisp-cfront-parse--advance)
       (list 'pre (nth 1 tk) (nelisp-cfront-parse--parse-unary)))
@@ -260,11 +424,15 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
       (list 'unop (nth 1 tk) (nelisp-cfront-parse--parse-unary)))
      ((and (eq (nth 0 tk) 'keyword) (string= (nth 1 tk) "sizeof"))
       (nelisp-cfront-parse--advance)
-      ;; sizeof(type) or sizeof expr — MVP: sizeof(type) only
-      (nelisp-cfront-parse--eat-punct "(")
-      (let ((ty (nelisp-cfront-parse--parse-type)))
-        (nelisp-cfront-parse--eat-punct ")")
-        (list 'sizeof ty)))
+      (if (and (nelisp-cfront-parse--at-punct "(")
+               (nelisp-cfront-parse--token-starts-type (cadr nelisp-cfront-parse--toks)))
+          ;; sizeof ( TYPE )
+          (progn (nelisp-cfront-parse--advance)
+                 (let ((ty (nelisp-cfront-parse--parse-type)))
+                   (nelisp-cfront-parse--eat-punct ")")
+                   (list 'sizeof ty)))
+        ;; sizeof EXPR  /  sizeof ( EXPR )
+        (list 'sizeof-expr (nelisp-cfront-parse--parse-unary))))
      (t (nelisp-cfront-parse--parse-postfix)))))
 
 (defun nelisp-cfront-parse--parse-postfix ()
@@ -326,6 +494,8 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
 
 (defun nelisp-cfront-parse--parse-stmt ()
   (cond
+   ((nelisp-cfront-parse--at-punct ";")        ; empty statement
+    (nelisp-cfront-parse--advance) (list 'block))
    ((nelisp-cfront-parse--at-punct "{") (nelisp-cfront-parse--parse-block))
    ((nelisp-cfront-parse--at-kw "if")
     (nelisp-cfront-parse--advance)
@@ -395,25 +565,36 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
         (nelisp-cfront-parse--eat-punct ";")))))
 
 (defun nelisp-cfront-parse--parse-decl ()
-  "Parse a local declaration `TYPE NAME [= INIT]' (no trailing `;')."
-  (let ((ty (nelisp-cfront-parse--parse-type)) (name nil) (init nil))
-    (if (nelisp-cfront-parse--at-fnptr-declarator)
-        (let ((fp (nelisp-cfront-parse--parse-fnptr-name ty)))
-          (setq ty (cdr fp) name (car fp)))
-      (setq name (nelisp-cfront-parse--eat-ident))
-      (when (nelisp-cfront-parse--at-punct "[")    ; array decl: TYPE NAME[SIZE]
-        (nelisp-cfront-parse--advance)
-        (let ((sz (nelisp-cfront-parse--parse-expr)))
-          (nelisp-cfront-parse--eat-punct "]")
-          (setq ty (append (list :base (plist-get ty :base)
-                                 :ptr (plist-get ty :ptr)
-                                 :array sz)
-                           (when (plist-get ty :unsigned) '(:unsigned t))
-                           (when (plist-get ty :struct) (list :struct (plist-get ty :struct))))))))
-    (when (nelisp-cfront-parse--at-punct "=")
-      (nelisp-cfront-parse--advance)
-      (setq init (nelisp-cfront-parse--parse-assign)))
-    (list 'decl ty name init)))
+  "Parse a (possibly multi-declarator) local declaration, no trailing `;'.
+Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
+  (let* ((ty0 (nelisp-cfront-parse--parse-type))
+         (base (nelisp-cfront-parse--base-type ty0))
+         (decls nil) (first t) (done nil))
+    (while (not done)
+      (let ((dty (if first ty0 base)) (name nil) (init nil))
+        (unless first
+          (let ((ptr 0))
+            (while (nelisp-cfront-parse--at-punct "*")
+              (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
+            (setq dty (plist-put (copy-sequence base) :ptr ptr))))
+        (if (nelisp-cfront-parse--at-fnptr-declarator)
+            (let ((fp (nelisp-cfront-parse--parse-fnptr-name dty)))
+              (setq dty (cdr fp) name (car fp)))
+          (setq name (nelisp-cfront-parse--eat-ident))
+          (while (nelisp-cfront-parse--at-punct "[")   ; array dims
+            (nelisp-cfront-parse--advance)
+            (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+            (nelisp-cfront-parse--eat-punct "]")
+            (setq dty (append dty (list :array t)))))
+        (when (nelisp-cfront-parse--at-punct "=")
+          (nelisp-cfront-parse--advance)
+          (setq init (nelisp-cfront-parse--parse-initializer)))
+        (push (list 'decl dty name init) decls)
+        (setq first nil)
+        (if (nelisp-cfront-parse--at-punct ",")
+            (nelisp-cfront-parse--advance)
+          (setq done t))))
+    (if (cdr decls) (cons 'decls (nreverse decls)) (car decls))))
 
 ;;; --- top level -------------------------------------------------------
 
@@ -428,6 +609,15 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
           (push (cons (car fp) (cdr fp)) nelisp-cfront-parse--typedefs)
           (list 'typedef (car fp) (cdr fp)))
       (let ((name (nelisp-cfront-parse--eat-ident)))
+        (when (nelisp-cfront-parse--at-punct "(")  ; function-type typedef: RET NAME(params)
+          (nelisp-cfront-parse--skip-paren-group)
+          (setq ty (list :base (or (plist-get ty :base) 'long) :ptr 1 :fnptr t)))
+        (when (nelisp-cfront-parse--at-punct "[")  ; array typedef: T NAME[N]
+          (nelisp-cfront-parse--advance)
+          (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+          (nelisp-cfront-parse--eat-punct "]")
+          (setq ty (plist-put (copy-sequence ty) :ptr
+                              (1+ (or (plist-get ty :ptr) 0)))))
         (nelisp-cfront-parse--eat-punct ";")
         ;; anonymous struct typedef: key the layout under the typedef name
         (when (and (eq (plist-get ty :base) 'struct)
@@ -442,12 +632,22 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
   (if (nelisp-cfront-parse--at-kw "typedef")
       (nelisp-cfront-parse--parse-typedef)
   (let ((ty (nelisp-cfront-parse--parse-type)))
-    (if (nelisp-cfront-parse--at-punct ";")
-        ;; bare type declaration with no declarator: `struct P { ... };'
-        (progn
-          (nelisp-cfront-parse--advance)
-          (list 'struct-def (plist-get ty :struct) (plist-get ty :fields)
-                (plist-get ty :union)))
+    (cond
+     ((nelisp-cfront-parse--at-punct ";")
+      ;; bare type declaration with no declarator: `struct P { ... };'
+      (nelisp-cfront-parse--advance)
+      (list 'struct-def (plist-get ty :struct) (plist-get ty :fields)
+            (plist-get ty :union)))
+     ((nelisp-cfront-parse--at-fnptr-declarator)
+      ;; function returning a fn-ptr (or a fn-ptr global): RET (*name(...))(...)
+      (let ((fp (nelisp-cfront-parse--parse-fnptr-name ty)))
+        (if (nelisp-cfront-parse--at-punct "{")
+            (list 'func (cdr fp) (car fp) nil (nelisp-cfront-parse--parse-block))
+          (when (nelisp-cfront-parse--at-punct "=")
+            (nelisp-cfront-parse--advance) (nelisp-cfront-parse--parse-initializer))
+          (nelisp-cfront-parse--eat-punct ";")
+          (list 'proto (cdr fp) (car fp) nil))))
+     (t
       (let ((name (nelisp-cfront-parse--eat-ident)))
         (if (nelisp-cfront-parse--at-punct "(")
             ;; function: params then body (or `;' prototype)
@@ -459,13 +659,31 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
                     (progn (nelisp-cfront-parse--advance)
                            (list 'proto ty name params))
                   (list 'func ty name params (nelisp-cfront-parse--parse-block)))))
-          ;; global variable
+          ;; global variable (array dims + initializer + comma declarators)
           (let ((init nil))
+            (while (nelisp-cfront-parse--at-punct "[")
+              (nelisp-cfront-parse--advance)
+              (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+              (nelisp-cfront-parse--eat-punct "]"))
             (when (nelisp-cfront-parse--at-punct "=")
               (nelisp-cfront-parse--advance)
-              (setq init (nelisp-cfront-parse--parse-assign)))
+              (setq init (nelisp-cfront-parse--parse-initializer)))
+            ;; additional comma-separated declarators (globals are deferred -> discard)
+            (while (nelisp-cfront-parse--at-punct ",")
+              (nelisp-cfront-parse--advance)
+              (while (nelisp-cfront-parse--at-punct "*") (nelisp-cfront-parse--advance))
+              (if (nelisp-cfront-parse--at-fnptr-declarator)
+                  (nelisp-cfront-parse--parse-fnptr-name ty)
+                (when (nelisp-cfront-parse--at 'ident) (nelisp-cfront-parse--advance)))
+              (while (nelisp-cfront-parse--at-punct "[")
+                (nelisp-cfront-parse--advance)
+                (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+                (nelisp-cfront-parse--eat-punct "]"))
+              (when (nelisp-cfront-parse--at-punct "=")
+                (nelisp-cfront-parse--advance)
+                (nelisp-cfront-parse--parse-initializer)))
             (nelisp-cfront-parse--eat-punct ";")
-            (list 'global ty name init))))))))
+            (list 'global ty name init)))))))))
 
 (defun nelisp-cfront-parse--parse-params ()
   (let ((params nil))
@@ -484,27 +702,38 @@ lowering is type-agnostic); the type is a plain pointer marked :fnptr."
     (nreverse params)))
 
 (defun nelisp-cfront-parse--parse-param ()
-  (let ((ty (nelisp-cfront-parse--parse-type)))
-    (if (nelisp-cfront-parse--at-fnptr-declarator)
-        (let ((fp (nelisp-cfront-parse--parse-fnptr-name ty)))
-          (list 'param (cdr fp) (car fp)))
-      (let ((name (if (nelisp-cfront-parse--at 'ident)
-                      (nth 1 (nelisp-cfront-parse--advance))
-                    nil)))               ; unnamed param allowed
-        (list 'param ty name)))))
+  (if (nelisp-cfront-parse--at-punct "...")       ; varargs ellipsis
+      (progn (nelisp-cfront-parse--advance) (list 'vararg))
+    (let ((ty (nelisp-cfront-parse--parse-type)))
+      (if (nelisp-cfront-parse--at-fnptr-declarator)
+          (let ((fp (nelisp-cfront-parse--parse-fnptr-name ty)))
+            (list 'param (cdr fp) (car fp)))
+        (let ((name (if (nelisp-cfront-parse--at 'ident)
+                        (nth 1 (nelisp-cfront-parse--advance))
+                      nil)))             ; unnamed param allowed
+          ;; tolerate array params `T name[...]'
+          (while (nelisp-cfront-parse--at-punct "[")
+            (nelisp-cfront-parse--advance)
+            (unless (nelisp-cfront-parse--at-punct "]") (nelisp-cfront-parse--parse-expr))
+            (nelisp-cfront-parse--eat-punct "]"))
+          (list 'param ty name))))))
 
 (defun nelisp-cfront-parse (tokens-or-source)
   "Parse TOKENS-OR-SOURCE into an AST `(program TOPLEVEL...)'.
 Accepts either a token list (from `nelisp-cfront-lex') or a C source
 string (which is lexed first)."
   (let ((nelisp-cfront-parse--toks
-         (if (stringp tokens-or-source)
-             (nelisp-cfront-lex tokens-or-source)
-           tokens-or-source))
-        (nelisp-cfront-parse--typedefs nil)
+         (nelisp-cfront-parse--strip-gcc
+          (if (stringp tokens-or-source)
+              (nelisp-cfront-lex tokens-or-source)
+            tokens-or-source)))
+        (nelisp-cfront-parse--typedefs
+         (copy-sequence nelisp-cfront-parse--builtin-typedefs))
         (tops nil))
     (while (not (nelisp-cfront-parse--at 'eof))
-      (push (nelisp-cfront-parse--parse-toplevel) tops))
+      (if (nelisp-cfront-parse--at-punct ";")   ; stray top-level semicolon
+          (nelisp-cfront-parse--advance)
+        (push (nelisp-cfront-parse--parse-toplevel) tops)))
     (cons 'program (nreverse tops))))
 
 (provide 'nelisp-cfront-parse)

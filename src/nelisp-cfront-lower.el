@@ -195,6 +195,7 @@ arrow/member lvalue E, or nil."
   (when (consp node)
     (pcase (car node)
       ('decl (push (nth 2 node) acc))
+      ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-decls d acc))))
       ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decls s acc))))
       ('if (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc))
            (setq acc (nelisp-cfront-lower--collect-decls (nth 3 node) acc)))
@@ -209,6 +210,7 @@ arrow/member lvalue E, or nil."
   (when (consp node)
     (pcase (car node)
       ('decl (push (cons (nth 2 node) (nth 1 node)) acc))
+      ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types d acc))))
       ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types s acc))))
       ('if (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc))
            (setq acc (nelisp-cfront-lower--collect-decl-types (nth 3 node) acc)))
@@ -247,6 +249,9 @@ arrow/member lvalue E, or nil."
                  ,(nelisp-cfront-lower--expr (nth 3 e))))
     ('index (nelisp-cfront-lower--load-lvalue e))      ; typed element load
     ('sizeof (nelisp-cfront-lower--sizeof (nth 1 e)))
+    ('sizeof-expr (nelisp-cfront-type-size (nelisp-cfront-lower--type-of (nth 1 e))
+                                           nelisp-cfront-lower--structs))
+    ('cast (nelisp-cfront-lower--expr (nth 2 e)))   ; untyped i64: cast is identity
     ((or 'pre 'post) (nelisp-cfront-lower--incdec e))
     ((or 'member 'arrow) (nelisp-cfront-lower--load-lvalue e))
     (_ (nelisp-cfront-lower--err :unsupported-expr e))))
@@ -485,10 +490,13 @@ Only a single top-level forward label (the cleanup pattern) is supported."
 (defun nelisp-cfront-lower--effect (s)
   "Lower statement S in effect (value-discarded) position."
   (pcase (car s)
-    ('decl (if (nth 3 s)
-               `(setq ,(nelisp-cfront-lower--lvar (nth 2 s))
-                      ,(nelisp-cfront-lower--expr (nth 3 s)))
-             0))                              ; uninitialised: slot already 0
+    ('decl (let ((init (nth 3 s)))
+             (if (and init (not (and (consp init) (eq (car init) 'init-list))))
+                 `(setq ,(nelisp-cfront-lower--lvar (nth 2 s))
+                        ,(nelisp-cfront-lower--expr init))
+               0)))    ; uninitialised, or aggregate init (local array/struct deferred)
+    ('decls (nelisp-cfront-lower--seq
+             (mapcar #'nelisp-cfront-lower--effect (cdr s))))
     ('expr-stmt (nelisp-cfront-lower--expr (nth 1 s)))
     ('block (nelisp-cfront-lower--stmts-effect (cdr s)))
     ('if `(if ,(nelisp-cfront-lower--cond (nth 1 s))

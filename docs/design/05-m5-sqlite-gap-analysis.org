@@ -79,3 +79,33 @@ advance.
 
 libxml2 (M6) is expected to need the same Tier 1-2 set plus its own
 encoding tables; run the same probe on it before starting.
+
+* §5 Progress log (=make gap FILE=/tmp/sqlite3.pp.c=)
+
+Tier 1 (and the first Tier-2 items) implemented; the first-parse-gap line
+advances as features land:
+
+| after | first gap (line) | feature that unblocked it |
+|-------+------------------+---------------------------|
+| baseline | 1 | — |
+| GCC builtins/attr skip | 3 | =__attribute__=, =__builtin_va_list= |
+| globals + initializers | 32 | array globals, =init-list= |
+| struct fn-ptr field | 69 | =int (*f)(...)= field |
+| tolerant declarator | 84 | =void (*(*f)(...))(...)= |
+| varargs ellipsis | 239 | =...= param |
+| unnamed fn-ptr param | 239 | =int (*)(void)= |
+| float/double/enum/_Bool | 880 | new base types |
+| struct multi-declarator | 1014 | =T *a, *b;= |
+| function-type typedef | 1258 | =typedef R N(args)= |
+| _Float* / __int128 | 1492 | extended builtin types |
+| pointer qualifiers | 1833 | =T * const * x= |
+| complex top-level declarator | 2458 | function returning fn-ptr |
+| casts | 3923 | =(type)expr= |
+| sizeof(expr) | 4335 | =sizeof EXPR= |
+| empty statements | 4395 | bare =;= |
+| local multi-declarator | 4429 | =T a=0, b=0;= |
+| *current* | *4429* | next: =switch=/=case= (Tier 2) |
+
+So ~4,400 lines of real preprocessed SQLite now parse.  Next Tier-2:
+=switch=/=case=, =do=…=while=, then the function-body lowering gaps.
+
