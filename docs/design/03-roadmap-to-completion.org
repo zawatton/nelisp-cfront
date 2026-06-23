@@ -39,7 +39,7 @@ asserted.
 | M2.4 | lowering AST → grammar | Doc 02 scheme; emits compilable grammar | |
 | M2.5 | CLI driver | =make cc FILE=foo.c= → .o; link+run a real C program | *= MVP-complete* |
 | M3 | libc-in-grammar | mem/str (self-compiled C) + arena alloc (mmap, runtime) done; POSIX global malloc waits on C globals | *done (subset)* |
-| M4 | hard-tail C | early-return-in-loop (break/flag), varargs, fn-ptrs, goto, struct-by-value, unions/bitfields; +native u16/u32 ops | |
+| M4 | hard-tail C | DONE: break/continue, early-return-in-loop, function pointers, typedef. TODO: goto, varargs, struct-by-value locals, unions/bitfields, fn-ptr declarator, native u16/u32 ops | *partial* |
 | M5 | SQLite | amalgamation compiles; nelisp-sqlite uses it | *= v1.0 / 脱ライブラリ* |
 | M6 | libxml2 | compiles; nelisp-http uses it (drops host libxml + regex fallback) | *= v1.0 / 脱ライブラリ* |
 
