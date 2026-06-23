@@ -624,7 +624,9 @@ arrays), so this is parse-only for now."
 Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
   (let* ((ty0 (nelisp-cfront-parse--parse-type))
          (base (nelisp-cfront-parse--base-type ty0))
-         (decls nil) (first t) (done nil))
+         (decls nil) (first t)
+         ;; bare type declaration (local struct/union/enum def, no declarator)
+         (done (nelisp-cfront-parse--at-punct ";")))
     (while (not done)
       (let ((dty (if first ty0 base)) (name nil) (init nil))
         (unless first
@@ -649,7 +651,9 @@ Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
         (if (nelisp-cfront-parse--at-punct ",")
             (nelisp-cfront-parse--advance)
           (setq done t))))
-    (if (cdr decls) (cons 'decls (nreverse decls)) (car decls))))
+    (cond ((null decls) '(block))       ; bare type declaration -> no-op statement
+          ((cdr decls) (cons 'decls (nreverse decls)))
+          (t (car decls)))))
 
 ;;; --- top level -------------------------------------------------------
 

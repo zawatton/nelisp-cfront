@@ -104,8 +104,23 @@ advances as features land:
 | sizeof(expr) | 4335 | =sizeof EXPR= |
 | empty statements | 4395 | bare =;= |
 | local multi-declarator | 4429 | =T a=0, b=0;= |
-| *current* | *4429* | next: =switch=/=case= (Tier 2) |
+| switch / do-while | 4585 | =switch/case= (fall-through+break), =do…while= |
+| anonymous bitfield | 4723 | =int : 32;= padding |
+| va_arg special form | 4762 | =__builtin_va_arg(ap, TYPE)= (parse-only) |
+| float literals | 5492 | =0.0=, =1e10= (lexer) |
+| comma operator | 5656 | =a, b= |
+| =signed= alone | 6014 | =(signed)x= |
+| =unsigned __int128= | 9567 | =__int128= family -> long |
+| storage classes | 11564 | =register/auto/volatile/inline= decls |
+| cast to fn-ptr/array | 13168 | =(RET(*)(args))x=, =(T[N])x= |
+| string concatenation | 13662 | ="a" "b"= |
+| anon aggregate member | 19571 | =union { ... };= in a struct |
+| local struct def | 24756 | =struct S {..};= inside a function |
+| *current* | *24756* | next: a deeply-nested ternary/comma expr |
 
-So ~4,400 lines of real preprocessed SQLite now parse.  Next Tier-2:
-=switch=/=case=, =do=…=while=, then the function-body lowering gaps.
+So *~24,700 of 84,092 lines (≈29%)* of real preprocessed sqlite3.c now
+parse.  The remaining tail is more function-body expression/statement
+forms, then the *lowering* gaps (float arithmetic via f64 grammar ops,
+enum-constant registration, aggregate/array-local storage) and the Tier-3
+upstream items (varargs ABI, alloca).  Continue with =make gap=.
 
