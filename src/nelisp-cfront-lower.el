@@ -117,6 +117,27 @@ struct/union value (base struct, no pointer)."
            (and (eq (plist-get ty :base) 'struct)
                 (= 0 (or (plist-get ty :ptr) 0))))))
 
+(defun nelisp-cfront-lower--narrow-int-width (ty)
+  "Byte width (1/2/4) when TY is a narrow integer carried in a 64-bit
+slot/register, else nil (full-width long/pointer, aggregate, or float).
+cfront keeps every value as i64, so a narrow int needs explicit sign/zero
+extension to behave like its C width at ABI / load boundaries."
+  (and (= 0 (or (plist-get ty :ptr) 0))
+       (null (plist-get ty :array))
+       (memq (plist-get ty :base) '(char short int))
+       (let ((w (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)))
+         (and (< w 8) w))))
+
+(defun nelisp-cfront-lower--normalize-narrow (g ty)
+  "Wrap grammar expr G to hold the correct narrow-int value of TY:
+sign-extend (signed) or mask (unsigned) to the type width.  Identity for
+full-width / non-integer types."
+  (let ((w (nelisp-cfront-lower--narrow-int-width ty)))
+    (cond
+     ((not w) g)
+     ((plist-get ty :unsigned) `(logand ,g ,(1- (ash 1 (* 8 w)))))
+     (t (let ((k (- 64 (* 8 w)))) `(sar (shl ,g ,k) ,k))))))
+
 (defun nelisp-cfront-lower--mem-var (name)
   "Return (NAME . TYPE) when NAME is a memory-backed local, else nil."
   (assoc name nelisp-cfront-lower--mem-vars))
@@ -298,10 +319,17 @@ arrow/member lvalue E, or nil."
                           (nelisp-cfront-lower--addr e) 4)
                         ,(plist-get fld :bit-offset))
                    ,mask))
-      (nelisp-cfront-lower--load-w
-       (nelisp-cfront-lower--addr e)
-       (nelisp-cfront-type-size (nelisp-cfront-lower--type-of e)
-                                nelisp-cfront-lower--structs)))))
+      ;; scalar load; `--load-w' zero-extends, so a SIGNED narrow int must
+      ;; be sign-extended to behave like its C width (unsigned is already
+      ;; exact from the masked byte load).
+      (let* ((ty (nelisp-cfront-lower--type-of e))
+             (g (nelisp-cfront-lower--load-w
+                 (nelisp-cfront-lower--addr e)
+                 (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)))
+             (w (nelisp-cfront-lower--narrow-int-width ty)))
+        (if (and w (not (plist-get ty :unsigned)))
+            (let ((k (- 64 (* 8 w)))) `(sar (shl ,g ,k) ,k))
+          g)))))
 
 (defun nelisp-cfront-lower--rvalue (e)
   "Lower memory lvalue E in rvalue (value) context.
@@ -1048,7 +1076,23 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (synth-binds (mapcar (lambda (v) (list v (list nelisp-cfront-lower--zero-fn)))
                               (reverse nelisp-cfront-lower--synth)))
          (binds (append local-binds synth-binds))
-         (wrapped (if binds `(let ,binds ,body-g) body-g)))
+         ;; SysV passes a narrow int arg in the low bits of a 64-bit
+         ;; register with the high bits unspecified (gcc zero-extends), so
+         ;; re-normalize each narrow-int param to its C width at entry —
+         ;; otherwise a negative `int' arg reads as a large positive i64.
+         (param-norms
+          (delq nil (mapcar
+                     (lambda (p)
+                       (and (nth 2 p)
+                            (nelisp-cfront-lower--narrow-int-width (nth 1 p))
+                            (let ((g (nelisp-cfront-lower--lvar (nth 2 p))))
+                              `(setq ,g ,(nelisp-cfront-lower--normalize-narrow
+                                          g (nth 1 p))))))
+                     params)))
+         (full-body (if param-norms
+                        (nelisp-cfront-lower--seq (append param-norms (list body-g)))
+                      body-g))
+         (wrapped (if binds `(let ,binds ,full-body) full-body)))
     `(defun ,name ,pnames ,wrapped)))
 
 (defun nelisp-cfront-lower-program (ast)

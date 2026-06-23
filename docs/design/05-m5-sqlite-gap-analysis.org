@@ -433,17 +433,32 @@ Result: =:early-return-in-loop= 136 → *0*; coverage 70.8% → *75.2%*
 partially-returning if/else-if chain (=classify=), =switch= returns
 (=sw_ret=), and a loop return (=loop_ret=) → =-1 0 1 2 129 2 -1=.
 
-*** §10.4.1 Discovered: narrow-int ABI sign-extension gap (separate bug)
+*** §10.4.1 narrow-int ABI sign-extension — FIXED (§10.5)
 
-The e2e above uses =long= params deliberately.  Writing =classify= with an
-=int= param returns the wrong branch for negatives: cfront treats every
-value as i64 and reads the full 64-bit argument register, but the SysV
-caller passes a 32-bit =int= in the low half (=mov edi,-5= *zero*-extends
-=rdi= to =0xFFFFFFFB=).  So a negative =int= arg reads as a large positive
-i64 and signed =<= (=setl=, correctly signed in the grammar) gives the
-wrong result.  This is a pre-existing correctness gap (cfront's "all i64"
-model vs C's sub-64-bit integer widths), invisible to =lower-gap= (which
-checks only that lowering *succeeds*).  Fixing it needs narrow-int
-sign-extension on param load / truncation on narrow ops — a separate,
-broad task tracked for after the coverage sweep.
+** §10.5 Narrow-int width correctness (char/short/int)
+
+A correctness fix (not a coverage bucket — =lower-gap= only checks that
+lowering *succeeds*, so this was invisible there).  cfront carries every
+value as i64; narrow ints need explicit sign/zero extension at two
+boundaries:
+
+1. *Function entry* — SysV passes a narrow int arg in the low bits of a
+   64-bit register with the high bits unspecified (gcc =mov edi,-5=
+   *zero*-extends =rdi= to =0xFFFFFFFB=).  Each narrow-int param is now
+   re-normalized at entry: =(setq p (sar (shl p K) K))= for signed
+   (K = 64 − 8·width), =(logand p MASK)= for unsigned.
+2. *Memory load* — =--load-w= zero-extends, so a SIGNED narrow field is
+   sign-extended after the load (=(sar (shl g K) K)=); unsigned is already
+   exact from the masked byte load.
+
+Helpers: =--narrow-int-width= (1/2/4 for char/short/int, else nil) and
+=--normalize-narrow=.  Verified e2e: =isneg(-5)=1=, =cmp2(-3,2)=1=,
+signed-char/short/int fields read back =-3 / -300 / -100000=, unsigned
+char =200=, and =classify= with an =int= param now branches correctly
+(=-888=).  Coverage unchanged (75.2%); suite 64/64.
+
+Still simplified (rare): narrow *arithmetic* overflow (=int+int= wraps at
+32 bits) is computed in 64-bit, and a narrow *local* assigned a wider
+value isn't truncated in its value slot — both only matter on actual
+overflow / out-of-range stores, deferred.
 
