@@ -48,6 +48,62 @@
   "Return the type a typedef NAME resolves to, or nil."
   (cdr (assoc name nelisp-cfront-parse--typedefs)))
 
+(defvar nelisp-cfront-parse--enum-consts nil
+  "Alist of enum-constant NAME -> integer value, accumulated during a parse.
+`parse-primary' folds a reference to such a NAME into its `(int VALUE)'.")
+
+(defun nelisp-cfront-parse--enum-lookup (name)
+  "Return (NAME . VALUE) when NAME is a known enum constant, else nil."
+  (assoc name nelisp-cfront-parse--enum-consts))
+
+(defun nelisp-cfront-parse--const-eval (e)
+  "Fold a constant-expression AST E to an integer (enum values).
+Enum-constant references are already folded to `(int N)' by
+`parse-primary', so only literals / arithmetic appear here.  Signals
+`nelisp-cfront-parse-error' when E is not a compile-time integer."
+  (pcase (car e)
+    ('int (nth 1 e))
+    ('cast (nelisp-cfront-parse--const-eval (nth 2 e)))   ; integer cast (value-preserving)
+    ('unop (let ((v (nelisp-cfront-parse--const-eval (nth 2 e))))
+             (pcase (nth 1 e)
+               ("-" (- v)) ("+" v) ("~" (lognot v)) ("!" (if (= v 0) 1 0))
+               (_ (signal 'nelisp-cfront-parse-error (list :non-const-unop e))))))
+    ('ternary (if (/= 0 (nelisp-cfront-parse--const-eval (nth 1 e)))
+                  (nelisp-cfront-parse--const-eval (nth 2 e))
+                (nelisp-cfront-parse--const-eval (nth 3 e))))
+    ('binop
+     (let ((a (nelisp-cfront-parse--const-eval (nth 2 e)))
+           (b (nelisp-cfront-parse--const-eval (nth 3 e))))
+       (pcase (nth 1 e)
+         ("+" (+ a b)) ("-" (- a b)) ("*" (* a b))
+         ("/" (if (= b 0) 0 (/ a b))) ("%" (if (= b 0) 0 (% a b)))
+         ("<<" (ash a b)) (">>" (ash a (- b)))
+         ("&" (logand a b)) ("|" (logior a b)) ("^" (logxor a b))
+         ("<" (if (< a b) 1 0)) (">" (if (> a b) 1 0))
+         ("<=" (if (<= a b) 1 0)) (">=" (if (>= a b) 1 0))
+         ("==" (if (= a b) 1 0)) ("!=" (if (/= a b) 1 0))
+         ("&&" (if (and (/= a 0) (/= b 0)) 1 0))
+         ("||" (if (or (/= a 0) (/= b 0)) 1 0))
+         (_ (signal 'nelisp-cfront-parse-error (list :non-const-binop e))))))
+    (_ (signal 'nelisp-cfront-parse-error (list :non-const-expr e)))))
+
+(defun nelisp-cfront-parse--parse-enum-body ()
+  "Parse an enum `{ NAME [= CONST] , ... }' (point at `{'), registering
+each constant into `--enum-consts' with C auto-increment semantics."
+  (nelisp-cfront-parse--eat-punct "{")
+  (let ((next 0))
+    (while (not (nelisp-cfront-parse--at-punct "}"))
+      (let ((name (nth 1 (nelisp-cfront-parse--advance))))   ; constant name (ident)
+        (when (nelisp-cfront-parse--at-punct "=")
+          (nelisp-cfront-parse--advance)
+          (setq next (nelisp-cfront-parse--const-eval
+                      (nelisp-cfront-parse--parse-ternary)))) ; constant-expression
+        (push (cons name next) nelisp-cfront-parse--enum-consts)
+        (setq next (1+ next))
+        (when (nelisp-cfront-parse--at-punct ",")
+          (nelisp-cfront-parse--advance))))
+    (nelisp-cfront-parse--eat-punct "}")))
+
 (defconst nelisp-cfront-parse--gcc-ignore
   '("__extension__" "__restrict" "__restrict__" "__inline" "__inline__"
     "__signed__" "__const" "__volatile__" "__nonnull" "__nothrow__")
@@ -185,14 +241,8 @@
             (setq struct-fields (nelisp-cfront-parse--parse-struct-body))))
          ((string= w "enum")
           (when (nelisp-cfront-parse--at 'ident) (nelisp-cfront-parse--advance)) ; tag
-          (when (nelisp-cfront-parse--at-punct "{")      ; skip the { ... } body
-            (nelisp-cfront-parse--advance)
-            (let ((d 1))
-              (while (> d 0)
-                (let ((x (nelisp-cfront-parse--advance)))
-                  (when (eq (nth 0 x) 'punct)
-                    (cond ((string= (nth 1 x) "{") (setq d (1+ d)))
-                          ((string= (nth 1 x) "}") (setq d (1- d)))))))))
+          (when (nelisp-cfront-parse--at-punct "{")      ; parse + register constants
+            (nelisp-cfront-parse--parse-enum-body))
           (push "int" specs))            ; enum is an int
          (t (push w specs)))))
     (let* ((specs (nreverse specs))
@@ -503,7 +553,10 @@ arrays), so this is parse-only for now."
                  (while (nelisp-cfront-parse--at 'string)
                    (setq str (concat str (nth 1 (nelisp-cfront-parse--advance)))))
                  (list 'str str)))
-      ('ident (nelisp-cfront-parse--advance) (list 'var (nth 1 tk)))
+      ('ident (nelisp-cfront-parse--advance)
+              (let ((ec (nelisp-cfront-parse--enum-lookup (nth 1 tk))))
+                (if ec (list 'int (cdr ec))      ; enum constant -> its integer value
+                  (list 'var (nth 1 tk)))))
       ('punct
        (if (string= (nth 1 tk) "(")
            (progn (nelisp-cfront-parse--advance)
@@ -788,6 +841,7 @@ string (which is lexed first)."
             tokens-or-source)))
         (nelisp-cfront-parse--typedefs
          (copy-sequence nelisp-cfront-parse--builtin-typedefs))
+        (nelisp-cfront-parse--enum-consts nil)
         (tops nil))
     (while (not (nelisp-cfront-parse--at 'eof))
       (if (nelisp-cfront-parse--at-punct ";")   ; stray top-level semicolon

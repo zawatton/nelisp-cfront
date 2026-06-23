@@ -196,7 +196,23 @@ graphs (= SQLite's own float math).  Interop with the external SysV
 =double= ABI (libm results, external callers) needs a thin
 =extern-call-f64= + =f64-bits= shim — a documented follow-on.
 
-*Remaining lowering gaps* (next, all cfront-side): enum-constant
-registration; aggregate/array-local storage (=alloca=, upstream);
-float call-arg coercion (needs param-type tracking in the funcs table).
+*Remaining lowering gaps* (next): aggregate/array-local storage
+(=alloca=, upstream); float call-arg coercion (needs param-type tracking
+in the funcs table).
+
+* §7 Enum constants — DONE
+
+The parser now *parses* an enum body (instead of skipping it) and
+registers each =NAME -> value= into =--enum-consts= with C semantics:
+auto-increment from 0, explicit =NAME = CONST=, and constant-expression
+initializers folded by =--const-eval= (literals, =+ - * / % << >> & | ^=,
+comparisons, =&& ||=, =~ ! -=, casts, ternary, and references to prior
+enum constants).  =parse-primary= folds a reference to a registered
+constant directly into =(int VALUE)=, so lowering needs no special case.
+
+Verified end-to-end (=test/nelisp-cfront-enum-test.el=): a program using
+bare + tagged + flag enums (=F2 = 1<<1=, =FALL = F1|F2|F3=) compiles and
+runs natively — =pick(1)=2 pick(5)=101 vals()=210 colors()=222
+flags()=7=.  =make gap= unchanged at line 24756 (no parse regression:
+all enums in the parsed prefix fold cleanly).  Suite 57/57 green.
 
