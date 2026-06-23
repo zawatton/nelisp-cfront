@@ -47,6 +47,26 @@ int main(void){
     (should (equal "7 12 11 30" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-fnptr-declarator-typedef ()
+  "M4: the `ret (*fp)(args)' declarator — as a typedef, a param, and a local."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef long (*binop_fn)(long, long);
+long add(long a, long b){ return a + b; }
+long mul(long a, long b){ return a * b; }
+long apply(binop_fn f, long a, long b){ return f(a, b); }
+long use(void){ binop_fn g = add; return g(10, 20) + apply(mul, 3, 4); }
+")
+         (drv "
+#include <stdio.h>
+extern long use(void);
+int main(void){ printf(\"%ld\\n\", use()); return use()==42 ? 0 : 1; }
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "42" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-fnptr-test)
 
 ;;; nelisp-cfront-fnptr-test.el ends here
