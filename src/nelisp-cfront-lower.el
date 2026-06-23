@@ -83,6 +83,16 @@ A `var' whose name is here is a local/param (lowers to its grammar slot);
 otherwise a name present in `--globals' is a global (lowers via
 `data-addr').  Locals therefore shadow same-named globals.")
 
+(defvar nelisp-cfront-lower--string-pool nil
+  "Alist S->SYM interning the program's C string literals (Doc 06 Step D).
+Each distinct (`equal') string literal becomes one NUL-terminated
+`data-blob' rodata symbol; `(str S)' lowers to `(data-addr SYM)'.  Filled
+as a side effect of lowering function bodies, then emitted by
+`lower-program'.")
+
+(defvar nelisp-cfront-lower--string-counter 0
+  "Counter for generating unique string-pool symbol names.")
+
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
 
@@ -252,6 +262,23 @@ non-integer globals are skipped (left for Step C)."
                     (push (cons name (list :type ty :bytes bytes)) out)))
               (error nil))))))           ; non-foldable -> skip this global
     (nreverse out)))
+
+;;; --- C string literal pool (Doc 06 Step D) --------------------------
+
+(defun nelisp-cfront-lower--intern-string (s)
+  "Return the rodata symbol for C string literal S, interning it into
+`--string-pool' (deduped by `equal') on first use."
+  (or (cdr (assoc s nelisp-cfront-lower--string-pool))
+      (let ((sym (intern (format "nlcf_str_%d"
+                                 nelisp-cfront-lower--string-counter))))
+        (setq nelisp-cfront-lower--string-counter
+              (1+ nelisp-cfront-lower--string-counter))
+        (push (cons s sym) nelisp-cfront-lower--string-pool)
+        sym)))
+
+(defun nelisp-cfront-lower--string-bytes (s)
+  "Return the NUL-terminated unibyte `.rodata' image of C string S."
+  (concat (encode-coding-string s 'utf-8 t) (unibyte-string 0)))
 
 ;;; --- soft-float conversions (double carried as i64 bits) ------------
 
@@ -515,7 +542,7 @@ so positions stay aligned to call arguments."
              ;; aggregate local decays to its block address (= the slot value);
              ;; plain scalar reads its value slot directly.
              (t (nelisp-cfront-lower--lvar name)))))
-    ('str (nelisp-cfront-lower--err :string-literal-unsupported e)) ; needs rodata
+    ('str `(data-addr ,(nelisp-cfront-lower--intern-string (nth 1 e)))) ; rodata pool
     ('binop (nelisp-cfront-lower--binop (nth 1 e) (nth 2 e) (nth 3 e)))
     ('unop (if (string= (nth 1 e) "*")
                (nelisp-cfront-lower--rvalue e)   ; typed deref (aggregate decays)
@@ -1213,6 +1240,10 @@ skipped in the MVP (functions only)."
          ;; `--structs' for element sizing), exposed to every function's type
          ;; env, and emitted as `data-blob' rodata symbols below.
          (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+         ;; String literal pool (Doc 06 Step D): filled while lowering the
+         ;; function bodies below, emitted as rodata `data-blob's afterward.
+         (nelisp-cfront-lower--string-pool nil)
+         (nelisp-cfront-lower--string-counter 0)
          (nelisp-cfront-lower--uses-float nil)
          (funcs nil))
     (dolist (top (cdr ast))
@@ -1225,12 +1256,16 @@ skipped in the MVP (functions only)."
         (_ (nelisp-cfront-lower--err :unsupported-toplevel top))))
     (cons 'seq
           (append
-           ;; rodata data symbols first, then the zero helper, float helpers,
-           ;; and the lowered functions.
+           ;; rodata data symbols first (globals + interned string literals),
+           ;; then the zero helper, float helpers, and the lowered functions.
            (mapcar (lambda (g)
                      `(data-blob ,(intern (car g))
                                  ,(plist-get (cdr g) :bytes) rodata))
                    nelisp-cfront-lower--globals)
+           (mapcar (lambda (e)
+                     `(data-blob ,(cdr e)
+                                 ,(nelisp-cfront-lower--string-bytes (car e)) rodata))
+                   (reverse nelisp-cfront-lower--string-pool))
            (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)
                  (append (when nelisp-cfront-lower--uses-float
                            (nelisp-cfront-float-helper-defuns))

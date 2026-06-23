@@ -119,10 +119,25 @@ real =sqlite3.pp.c=: =:deref-non-pointer= 110 → 68, overall coverage 75.2%
   struct into =.data=/=.bss=; member/index via =data-addr-local= + offset.
 - Mutable globals: same address op, normal load/store.
 
-** Step D — string literals (=:string-literal=, 276)
-- A rodata string pool: intern each C string literal as a =data-blob= in
-  =.rodata=; lower =(str S)= to =data-addr-local= of its pool entry.
-- Largest single bucket; unblocked by the same Step-A keystone.
+** Step D — string literals (=:string-literal=, 282)  [DONE 2026-06-24]
+Implemented in cfront (=nelisp-cfront-lower=):
+- =--string-pool= interns each distinct (=equal=) C string literal into a
+  unique =nlcf_str_N= symbol (=--intern-string=); filled as a side effect
+  of lowering function bodies.
+- =--expr= =('str)= lowers to =(data-addr SYM)= (was
+  =:string-literal-unsupported=).
+- =lower-program= emits one NUL-terminated =(data-blob SYM BYTES rodata)=
+  per distinct string (=--string-bytes= = UTF-8 + =\0=), beside the Step B
+  global blobs.  =lower-gap-probe= binds the pool too.
+- No new grammar op (reuses Step A =data-addr= against the local blob
+  symbol); equal literals dedup to one symbol (verified by pointer
+  identity in the e2e).
+
+Verified: ERT =nelisp-cfront-string-*= (intern/dedup/NUL unit + cc-linked
+e2e: content, empty string, indexing a literal, pointer-identity dedup;
+69/69 suite green).  =lower-gap= on real =sqlite3.pp.c=:
+=:string-literal-unsupported= 282 → 0, overall coverage 76.5% → *86.7%*
+(1829 → 2073 / 2392) — the single largest milestone jump.
 
 * §4 Status / estimate
 

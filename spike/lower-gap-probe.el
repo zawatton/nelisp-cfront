@@ -51,6 +51,8 @@
            (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
            (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
            (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+           (nelisp-cfront-lower--string-pool nil)
+           (nelisp-cfront-lower--string-counter 0)
            (nelisp-cfront-lower--uses-float nil))
       (dolist (top funcs)
         (condition-case e
