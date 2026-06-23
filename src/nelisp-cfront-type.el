@@ -74,19 +74,24 @@
 
 (defun nelisp-cfront-type--round-up (n a) (* (/ (+ n a -1) a) a))
 
-(defun nelisp-cfront-type-layout (fields structs)
-  "Compute layout for struct FIELDS (a list of (field TY NAME)).
+(defun nelisp-cfront-type-layout (fields structs &optional union-p)
+  "Compute layout for struct/union FIELDS (a list of (field TY NAME)).
+When UNION-P, every field is at offset 0 and size = max field size.
 Returns (:size N :align A :fields ALIST)."
-  (let ((off 0) (align 1) (alist nil))
+  (let ((off 0) (align 1) (maxsz 0) (alist nil))
     (dolist (f fields)
       (let* ((ty (nth 1 f)) (name (nth 2 f))
              (sz (nelisp-cfront-type-size ty structs))
              (al (nelisp-cfront-type-align ty structs)))
-        (setq off (nelisp-cfront-type--round-up off al))
-        (push (cons name (list :type ty :offset off :size sz)) alist)
-        (setq off (+ off sz))
+        (if union-p
+            (progn
+              (push (cons name (list :type ty :offset 0 :size sz)) alist)
+              (setq maxsz (max maxsz sz)))
+          (setq off (nelisp-cfront-type--round-up off al))
+          (push (cons name (list :type ty :offset off :size sz)) alist)
+          (setq off (+ off sz)))
         (setq align (max align al))))
-    (list :size (nelisp-cfront-type--round-up off align)
+    (list :size (nelisp-cfront-type--round-up (if union-p maxsz off) align)
           :align align
           :fields (nreverse alist))))
 
@@ -97,14 +102,14 @@ Also scans inline `:fields' on struct types in params/decls."
     (dolist (top (cdr program))
       (pcase (car top)
         ('struct-def
-         (let ((name (nth 1 top)) (fields (nth 2 top)))
+         (let ((name (nth 1 top)) (fields (nth 2 top)) (union-p (nth 3 top)))
            (when (and name fields)
-             (push (cons name (nelisp-cfront-type-layout fields structs)) structs))))
+             (push (cons name (nelisp-cfront-type-layout fields structs union-p)) structs))))
         ('typedef
          (let* ((ty (nth 2 top)) (name (plist-get ty :struct))
-                (fields (plist-get ty :fields)))
+                (fields (plist-get ty :fields)) (union-p (plist-get ty :union)))
            (when (and name fields)
-             (push (cons name (nelisp-cfront-type-layout fields structs)) structs))))
+             (push (cons name (nelisp-cfront-type-layout fields structs union-p)) structs))))
         (_ nil)))
     structs))
 

@@ -50,7 +50,7 @@
 
 (defconst nelisp-cfront-parse--type-keywords
   '("void" "char" "short" "int" "long" "unsigned" "signed" "const"
-    "struct" "static" "extern")
+    "struct" "union" "static" "extern")
   "Keywords that may begin / appear in a type-specifier sequence.")
 
 ;;; --- cursor ----------------------------------------------------------
@@ -107,7 +107,8 @@
         (while (nelisp-cfront-parse--at-punct "*")
           (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
         (plist-put (copy-sequence bt) :ptr ptr))
-    (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil))
+    (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil)
+          (is-union nil))
       (while (and (nelisp-cfront-parse--at 'keyword)
                   (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords))
       (let ((w (nth 1 (nelisp-cfront-parse--advance))))
@@ -115,8 +116,9 @@
          ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
          ((string= w "unsigned") (setq unsigned t))
          ((string= w "signed") nil)
-         ((string= w "struct")
-          (when (nelisp-cfront-parse--at 'ident)         ; tag is optional (anonymous struct)
+         ((or (string= w "struct") (string= w "union"))
+          (when (string= w "union") (setq is-union t))
+          (when (nelisp-cfront-parse--at 'ident)         ; tag is optional (anonymous)
             (setq struct-name (nth 1 (nelisp-cfront-parse--advance))))
           (when (nelisp-cfront-parse--at-punct "{")
             (setq struct-fields (nelisp-cfront-parse--parse-struct-body))))
@@ -139,7 +141,8 @@
       (append (list :base base :ptr ptr)
               (when unsigned '(:unsigned t))
               (when struct-name (list :struct struct-name))
-              (when struct-fields (list :fields struct-fields)))))))
+              (when struct-fields (list :fields struct-fields))
+              (when is-union '(:union t)))))))
 
 (defun nelisp-cfront-parse--parse-struct-body ()
   "Parse `{ TYPE NAME; ... }' into a list of (field TYPE NAME)."
@@ -389,7 +392,8 @@
         ;; bare type declaration with no declarator: `struct P { ... };'
         (progn
           (nelisp-cfront-parse--advance)
-          (list 'struct-def (plist-get ty :struct) (plist-get ty :fields)))
+          (list 'struct-def (plist-get ty :struct) (plist-get ty :fields)
+                (plist-get ty :union)))
       (let ((name (nelisp-cfront-parse--eat-ident)))
         (if (nelisp-cfront-parse--at-punct "(")
             ;; function: params then body (or `;' prototype)
