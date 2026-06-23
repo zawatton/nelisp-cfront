@@ -393,3 +393,22 @@ The dominant bucket is now =:string-literal-unsupported= (244 — needs an
 object-mode rodata string pool), then =:incdec-needs-var= (174 — lvalue
 =++=/=--=).
 
+** §10.3 =:incdec-needs-var= crushed (174 → 0; coverage 65% → 71%)
+
+=++=/=--= only handled plain var targets.  Generalised by *desugaring*
+=TARGET++= to =TARGET = TARGET + 1= and reusing =--assign= / =--binop=:
+this covers every lvalue (=p->f=, =a[i]=, =*p=, bitfield, address-taken
+scalar) and — because the =+=/=-= flows through =--binop= — also fixes
+pointer =++= (advances by the pointee size) and float =++= (adds =1.0=),
+which the old var-only path got wrong.  (A side-effecting lvalue
+subexpression like =a[i++]++= is re-read and not modelled — rare.)
+
+Result: =:incdec-needs-var= 174 → *0*; coverage 64.9% → *70.8%*
+(1,693 / 2,392 functions).  Verified e2e: =memberinc/arrinc/derefinc=
+(=c->n++= / =a[i]++= / =(*p)++=), =ptrnext= (=p++= = scaled, lands on the
+next element), =predec= (=--x=) → =42 6 100 20 49=.
+
+Dominant bucket now =:string-literal-unsupported= (263 — object-mode
+rodata string pool), then =:early-return-in-loop= (136) and
+=:unknown-struct= (128 — globals).
+

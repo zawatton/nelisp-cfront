@@ -153,6 +153,36 @@ int main(void){
     (should (equal "1 5 2 0" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-e2e-incdec-lvalues ()
+  "++/-- on any lvalue (member / index / deref / pointer / var), via the
+`t = t <op> 1' desugar — so pointer ++ scales by the pointee size."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+struct C { int n; };
+int memberinc(struct C *c){ c->n++; return c->n; }
+int arrinc(int *a, int i){ a[i]++; return a[i]; }
+int derefinc(int *p){ (*p)++; return *p; }
+int ptrnext(int *p){ p++; return *p; }
+int predec(int x){ return --x; }
+")
+         (drv "
+#include <stdio.h>
+struct C { int n; };
+extern int memberinc(struct C*); extern int arrinc(int*,int);
+extern int derefinc(int*); extern int ptrnext(int*); extern int predec(int);
+int main(void){
+  struct C c; c.n = 41;
+  int a[3] = {5,20,30}; int v = 99;
+  int r1=memberinc(&c), r2=arrinc(a,0), r3=derefinc(&v), r4=ptrnext(a), r5=predec(50);
+  printf(\"%d %d %d %d %d\\n\", r1,r2,r3,r4,r5);
+  return (r1==42 && r2==6 && r3==100 && r4==20 && r5==49)?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "42 6 100 20 49" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-e2e-test)
 
 ;;; nelisp-cfront-e2e-test.el ends here

@@ -585,24 +585,18 @@ matches C, so the raw value is used directly."
       (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs)))))
 
 (defun nelisp-cfront-lower--incdec (e)
-  "Lower ++/-- (pre or post).  Returns the assigned value (exact for pre
-and for statement position; post in value position returns the new value
-in this MVP)."
-  (let ((target (nth 2 e)) (op (nth 1 e)))
-    (unless (eq (car target) 'var)
-      (nelisp-cfront-lower--err :incdec-needs-var target))
-    (let ((cname (nth 1 target))
-          (delta (if (string= op "++") 1 -1)))
-      (if (nelisp-cfront-lower--mem-var-scalar-p cname)
-          ;; address-taken scalar: load / +delta / store through the pointer
-          (let ((addr (nelisp-cfront-lower--lvar cname))
-                (width (nelisp-cfront-type-size
-                        (cdr (nelisp-cfront-lower--mem-var cname))
-                        nelisp-cfront-lower--structs)))
-            (nelisp-cfront-lower--store-w
-             addr width `(+ ,(nelisp-cfront-lower--load-w addr width) ,delta)))
-        (let ((name (nelisp-cfront-lower--lvar cname)))
-          `(setq ,name (+ ,name ,delta)))))))
+  "Lower ++/-- (pre or post) on ANY lvalue by desugaring to
+`TARGET = TARGET <op> 1' and reusing `--assign' / `--binop'.  This
+covers var / p->f / a[i] / *p / bitfield / address-taken scalar, and —
+because the `+'/`-' goes through `--binop' — gets pointer-arithmetic
+scaling (=p++= advances by the pointee size) and float (=d++= adds 1.0)
+right.  Returns the new value (the assigned value); a post-increment in
+value position thus yields the new value in this MVP, exact in statement
+position (the dominant case).  TARGET is re-read for the binop, so an
+lvalue with a side-effecting subexpression (=a[i++]++=) is not modelled."
+  (let ((target (nth 2 e))
+        (op (if (string= (nth 1 e) "++") "+" "-")))
+    (nelisp-cfront-lower--assign "=" target (list 'binop op target '(int 1)))))
 
 (defun nelisp-cfront-lower--sizeof (ty)
   (let ((ptr (plist-get ty :ptr)))
