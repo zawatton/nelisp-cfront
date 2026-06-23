@@ -125,12 +125,22 @@ Also scans inline `:fields' on struct types in params/decls."
         ('struct-def
          (let ((name (nth 1 top)) (fields (nth 2 top)) (union-p (nth 3 top)))
            (when (and name fields)
-             (push (cons name (nelisp-cfront-type-layout fields structs union-p)) structs))))
+             ;; Tolerant: a struct whose layout can't yet be computed
+             ;; (e.g. an anonymous struct-by-value member) is skipped, not
+             ;; fatal — functions that need it fail individually at lower
+             ;; time rather than blocking the whole program.
+             (condition-case nil
+                 (push (cons name (nelisp-cfront-type-layout fields structs union-p))
+                       structs)
+               (nelisp-cfront-type-error nil)))))
         ('typedef
          (let* ((ty (nth 2 top)) (name (plist-get ty :struct))
                 (fields (plist-get ty :fields)) (union-p (plist-get ty :union)))
            (when (and name fields)
-             (push (cons name (nelisp-cfront-type-layout fields structs union-p)) structs))))
+             (condition-case nil
+                 (push (cons name (nelisp-cfront-type-layout fields structs union-p))
+                       structs)
+               (nelisp-cfront-type-error nil)))))
         (_ nil)))
     structs))
 

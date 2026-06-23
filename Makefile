@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc gap help
+.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc gap lower-gap help
 
 EMACS ?= emacs
 
@@ -85,6 +85,13 @@ gap:
 	$(EMACS) -Q --batch $(LOADPATH) \
 	  -l spike/gap-probe.el \
 	  --eval '(nelisp-cfront-gap-probe)'
+
+# Lowering gap probe: per-function lowering coverage + failure buckets.
+#   make lower-gap FILE=/tmp/sqlite3.pp.c
+lower-gap:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l spike/lower-gap-probe.el \
+	  --eval '(nelisp-cfront-lower-gap-probe)'
 
 clean:
 	rm -f src/*.elc test/*.elc spike/*.elc

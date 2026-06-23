@@ -298,3 +298,47 @@ walks it per type class; the caller must set =AL= (vector-count) and
 pass the stack-arg tail.  Scoped as the next upstream milestone — the
 =frame-alloc= keystone landed here unblocks its save-area piece.
 
+* §10 Lowering coverage — data-driven (=make lower-gap=)
+
+Now that the front-end parses 100% of =sqlite3.c=, =spike/lower-gap-probe.el=
+measures the *back-end*: it lowers each =func= top-level independently
+through =--func= and buckets the failures by reason — the lowering analogue
+of the parse gap probe.  First run:
+
+#+begin_example
+functions: 2392 total, 866 lowered OK (36.2%), 1526 failed
+  :unknown-struct                    1065   sqlite3StatusValue
+  :string-literal-unsupported          96   parseHhMmSs
+  :incdec-needs-var                    92   et_getdigit
+  :deref-non-pointer                   86   sqlite3CompileOptions
+  :unsupported-load-width              79   toLocaltime
+  :early-return-in-loop-unsupported    70   parseDateOrTime
+  :addr-of-non-memory-var              29   pthreadMutexAlloc
+  :non-constant-array-size              5   sqlite3LogEstAdd
+  :varargs-unsupported                  3   sqlite3_str_vappendf
+  excessive-lisp-nesting                1   yy_reduce
+#+end_example
+
+*36.2% of real SQLite functions already lower* to the nelisp-cc grammar.
+The backlog is now ranked by real demand:
+
+1. =:unknown-struct= (*1065*, 70% of failures) — the dominant blocker.
+   The struct table can't lay out some structs (anonymous struct-by-value
+   members, forward-referenced tags), so every function touching one
+   fails.  Completing struct layout is the single highest-value fix.
+2. =:string-literal-unsupported= (96) — needs rodata in object mode (the
+   v1 object writer forbids =.rodata=); a string-pool emit.
+3. =:incdec-needs-var= (92) — =++=/=--= on =p->f= / =a[i]= / =*p= (only
+   plain vars handled today); generalise to any lvalue.
+4. =:deref-non-pointer= (86) — type-inference gaps (deref of a value the
+   inferencer doesn't type as a pointer).
+5. =:unsupported-load-width= (79) — loads of non-{1,2,4,8} widths (struct
+   by value, 16-byte types).
+6. =:early-return-in-loop-unsupported= (70) — single-exit detection misses
+   some nested return-in-loop shapes.
+7. =:addr-of-non-memory-var= (29) — address-taken params (deferred, §9.3).
+8. tail: non-const array size (5), varargs (3), and one
+   =excessive-lisp-nesting= (=yy_reduce=, the giant generated parser).
+
+Re-run =make lower-gap FILE=...= after each fix to watch coverage climb.
+
