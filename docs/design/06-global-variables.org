@@ -1,0 +1,97 @@
+#+TITLE: Doc 06 — Global variable support (M5 lowering milestone)
+#+AUTHOR: zawatton + Claude
+#+DATE: 2026-06-23
+#+STATUS: design + feasibility verified; implementation is a multi-step milestone
+
+* §0 Why
+
+After the M5 lowering sweep (Doc 05 §10, coverage 36% → 75%), the
+=lower-gap= backlog is dominated by *global variables*:
+
+| bucket | count | global-related |
+|--------+-------+----------------|
+| =:string-literal-unsupported= | 276 | yes (rodata strings) |
+| =:unknown-struct= | 134 | ~100 (global struct vars) |
+| =:deref-non-pointer= | 110 | yes (global array index/deref) |
+
+That is ≈480 of the ≈594 remaining lowering failures.  All three share
+one missing capability: *static/global data in cfront's ET_REL object
+output, addressable from =.text=*.
+
+Diagnosis evidence (=:deref-non-pointer=): every sampled function
+(=sqlite3StrICmp=, =sqlite3Utf8Read=, =getDigits=, =sqlite3CompileOptions=,
+…) fails indexing a *global array* — =sqlite3UpperToLower[c]=,
+=sqlite3CtypeMap[c]=, =sqlite3Utf8Trans1[...]=, =sqlite3azCompileOpt[0]=.
+The global isn't in =tenv=, types as =long=, and =a[i]= /=*p= then
+signals =:deref-non-pointer=.
+
+* §1 Why it is NOT a quick fix
+
+- cfront skips =global= top-levels entirely (=lower-program=), and its
+  object mode emits *no* data — only =.text= (the "v1 object mode forbids
+  rodata" limitation).
+- Type tracking alone is insufficient: even with a global's type known, a
+  reference needs the global's *address*, which in an ET_REL object is a
+  *relocation* against a data symbol — not an absolute value.
+- The obvious upstream lever, =static-imm32-table-define= /
+  =static-imm32-table-lookup=, is *executable-mode only*: it bakes an
+  absolute =.rodata= vaddr (=mov rdi, <vaddr>=), which is unknown in a
+  relocatable object → it signals =:static-imm32-table-vaddr-missing= when
+  driven through =nelisp-aot-compile-to-object=.  Verified 2026-06-23.
+
+* §2 Feasibility — the ELF writer already has the primitives
+
+=lisp/nelisp-elf-write.el= supports everything at the file level:
+- =.rodata= / =.data= / =.bss= (NOBITS) sections,
+- =.symtab= with =st_value= (defined local/global symbols),
+- relocations: =R_X86_64_64= (=abs64=), =R_X86_64_PC32= (=pc32=),
+  =R_X86_64_PLT32= (=plt32=); reloc-type map in =--reloc-type-code=.
+
+So the *file format* can express "a data blob with a local symbol, and a
+=.text= PC32 reference to it".  The gap is purely in the AOT *compiler*
+pipeline: the ET_REL emit path does not currently (a) place
+caller-provided data blobs into =.rodata=/=.data=/=.bss= with a symbol,
+nor (b) expose a grammar op that emits a same-unit data-symbol address
+reference (the existing =data-addr= is for *external* symbols only).
+
+* §3 Plan (layered; re-measure with =make lower-gap= after each step)
+
+** Step A — upstream keystone: same-unit data definition + address
+Add to =nelisp-aot-compiler.el= (ET_REL path) two grammar ops:
+- =(data-blob NAME BYTES SECTION)= — emit BYTES into =.rodata= (or
+  =.data=/=.bss=) and define a local symbol NAME at its offset.
+- =(data-addr-local NAME)= — load NAME's address into rax via a PC32 (or
+  abs64) relocation against the local symbol.
+This is the real work, but rides the existing =nelisp-elf-write= data /
+symtab / reloc machinery.  Verify like f64-bits / frame-alloc: emit a
+blob + a function returning =data-addr-local=, link with a C driver,
+read the bytes back.
+
+** Step B — cfront: read-only integer global arrays (the =:deref= bucket)
+- Parser: retain global array initializer values (const-fold the
+  =init-list= elements to integers).
+- =--globals= registry: NAME → (type, optional const bytes).
+- Add globals to =tenv= so =type-of= resolves them (fixes the *type*
+  half: =sizeof(G)=, =G[i]= element type).
+- Emit each used const global as a =data-blob=; lower =G[i]= /=*p= to a
+  load at =(+ (data-addr-local "G") (* i elemsize))=.
+
+** Step C — general globals (.data read/write, struct/scalar globals)
+- =:unknown-struct= globals (=sqlite3Stat.nowValue[op]=): emit the global
+  struct into =.data=/=.bss=; member/index via =data-addr-local= + offset.
+- Mutable globals: same address op, normal load/store.
+
+** Step D — string literals (=:string-literal=, 276)
+- A rodata string pool: intern each C string literal as a =data-blob= in
+  =.rodata=; lower =(str S)= to =data-addr-local= of its pool entry.
+- Largest single bucket; unblocked by the same Step-A keystone.
+
+* §4 Status / estimate
+
+Feasibility *verified* (§2).  Step A is a focused upstream addition
+(object-mode data sections + local symbol + reloc) — moderate but deep
+(touches the ET_REL section assembly + symtab + reloc tables).  Steps B-D
+are then cfront-side, each re-measured against =lower-gap=.  Expected
+combined impact: the ≈480 global/string failures, i.e. coverage from 75%
+toward ~95%.  This is the clear next M5 milestone, scoped here so it can
+be executed without re-deriving the analysis.

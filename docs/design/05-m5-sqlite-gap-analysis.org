@@ -462,3 +462,22 @@ Still simplified (rare): narrow *arithmetic* overflow (=int+int= wraps at
 value isn't truncated in its value slot — both only matter on actual
 overflow / out-of-range stores, deferred.
 
+** §10.6 =:deref-non-pointer= diagnosis → global variables (Doc 06)
+
+Diagnosed (not a type-inference micro-gap): every sampled =:deref-non-pointer=
+function fails *indexing a global array* — =sqlite3UpperToLower[c]=,
+=sqlite3CtypeMap[c]=, =sqlite3Utf8Trans1=, =sqlite3azCompileOpt[0]=.  The
+global isn't in =tenv=, types as =long=, and =a[i]= / =*p= signals.
+
+This is the same root as the global share of =:unknown-struct= and all of
+=:string-literal= — together ≈480 of the ≈594 remaining failures need
+*global / static data in cfront's ET_REL object*, addressable from =.text=.
+
+Feasibility verified: the ELF writer (=nelisp-elf-write.el=) already has
+=.rodata=/=.data=/=.bss=, =.symtab=, and =abs64=/=pc32= relocations; but
+the AOT *compiler's* object path emits no data, and the
+=static-imm32-table= lever is executable-mode-only (bakes an absolute
+vaddr → fails in ET_REL).  So global support is the next *milestone*
+(upstream object-mode data+reloc op, then cfront global emission), not a
+quick bucket fix.  Full design + layered plan in *Doc 06*.
+
