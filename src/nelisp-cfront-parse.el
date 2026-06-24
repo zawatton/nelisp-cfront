@@ -339,12 +339,17 @@ the lowerer can lift a function-static local to a module global."
             (unless (eq (car w) 'int)
               (signal 'nelisp-cfront-parse-error (list :non-constant-bitfield-width w)))
             (setq bits (nth 1 w))))
-         ;; array field: TYPE NAME[N]
+         ;; array field: TYPE NAME[N] / NAME[] (C99 flexible array member) /
+         ;; NAME[N][M] (multi-dimensional).
          ((nelisp-cfront-parse--at-punct "[")
-          (nelisp-cfront-parse--advance)
-          (let ((sz (nelisp-cfront-parse--fold-dim (nelisp-cfront-parse--parse-expr))))
-            (nelisp-cfront-parse--eat-punct "]")
-            (setq fty (append fty (list :array sz))))))
+          (while (nelisp-cfront-parse--at-punct "[")
+            (nelisp-cfront-parse--advance)
+            (let ((sz (if (nelisp-cfront-parse--at-punct "]")
+                          t                 ; `[]' = flexible array member
+                        (nelisp-cfront-parse--fold-dim
+                         (nelisp-cfront-parse--parse-expr)))))
+              (nelisp-cfront-parse--eat-punct "]")
+              (setq fty (append fty (list :array sz)))))))
         (push (list 'field fty fname bits) fields)
         ;; additional comma-separated declarators sharing the base type
         (let ((base (nelisp-cfront-parse--base-type fty)))

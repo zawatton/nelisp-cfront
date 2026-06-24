@@ -50,7 +50,13 @@ the tag up in STRUCTS by name."
   (let ((ptr (or (plist-get ty :ptr) 0))
         (arr (plist-get ty :array)))
     (cond
-     ((and arr (> ptr 0)) 8)            ; array of pointers element handled elsewhere
+     ;; flexible / incomplete array member (`T name[];') contributes 0 to
+     ;; sizeof (it is a trailing member; only its offset matters).
+     ((eq arr t) 0)
+     ;; array of E: dim * size(element), where the element = TY with ONE
+     ;; dimension removed.  `--strip-array' peels one dim, so multi-dim
+     ;; arrays recurse correctly (`int[2][3]' = 2 * 3 * 4 = 24); an array of
+     ;; pointers (`T *p[N]') recurses to the pointer (8) * N, not a flat 8.
      (arr (* (nelisp-cfront-type-size
               (nelisp-cfront-type--strip-array ty) structs)
              (nelisp-cfront-type--eval-dim arr structs)))
@@ -71,11 +77,15 @@ the tag up in STRUCTS by name."
      (t (nelisp-cfront-type--scalar-size (plist-get ty :base))))))
 
 (defun nelisp-cfront-type--strip-array (ty)
-  "Return TY with its :array entries removed (= the array element type),
-preserving plist key/value order."
-  (let ((out nil) (p ty))
+  "Return TY with its FIRST :array entry removed (= the array element type
+after one index), preserving plist key/value order.  Peeling a single
+dimension lets `type-size'/`type-align'/`type-elem' recurse through
+multi-dimensional arrays correctly (each index / each recursion removes one
+dimension); a one-dimensional array reduces to its scalar/pointer element."
+  (let ((out nil) (p ty) (dropped nil))
     (while p
-      (unless (eq (car p) :array)
+      (if (and (not dropped) (eq (car p) :array))
+          (setq dropped t)              ; drop only the first :array
         (setq out (append out (list (car p) (cadr p)))))
       (setq p (cddr p)))
     out))

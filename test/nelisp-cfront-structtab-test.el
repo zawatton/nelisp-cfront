@@ -163,6 +163,58 @@ int main(void){
     (should (equal "42 30" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-structtab-flexible-array-member-parses ()
+  "A C99 flexible array member `T name[];' in a struct, and a
+multi-dimensional field `T m[2][3];', parse (the `[]' dim -> `:array t');
+the leading fields still lay out.  (libxml2's `_xmlDefAttrs' uses a FAM.)"
+  (let* ((ast (nelisp-cfront-parse "
+struct FAM { int nbAttrs; int maxAttrs; const char *values[]; };
+struct MD { int n; int m[2][3]; };
+"))
+         (tbl (nelisp-cfront-type-build-structs ast))
+         (fam-fields (nth 2 (cl-find-if (lambda (tp)
+                                          (and (eq (car tp) 'struct-def)
+                                               (equal (nth 1 tp) "FAM")))
+                                        (cdr ast)))))
+    ;; the FAM field parsed with an unknown (`t') array dimension
+    (let ((vf (cl-find-if (lambda (f) (equal (nth 2 f) "values")) fam-fields)))
+      (should vf)
+      (should (eq t (plist-get (nth 1 vf) :array)))
+      (should (= 1 (or (plist-get (nth 1 vf) :ptr) 0))))
+    ;; MD lays out and its multi-dim field is sized 2*3*4 = 24
+    (should (assoc "MD" tbl))
+    (should (= (+ 4 24) (plist-get (cdr (assoc "MD" tbl)) :size)))))
+
+(ert-deftest nelisp-cfront-structtab-multidim-array-e2e ()
+  "A multi-dimensional local array indexes and sizes correctly (each index
+peels one dimension; `sizeof' is the full product, not first-dim*element),
+and a struct holding a 2-D field lays out at the true size.  Guards the
+`--strip-array' one-dimension-peel fix."
+  (unless (nelisp-cfront-structtab-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-structtab-test--run "
+struct G { int cells[2][3]; int tag; };
+int grid(void){
+  int m[2][3];
+  int i, j, s = 0;
+  for (i = 0; i < 2; i++) for (j = 0; j < 3; j++) m[i][j] = i * 10 + j;
+  for (i = 0; i < 2; i++) for (j = 0; j < 3; j++) s += m[i][j];
+  return s + m[1][2];               /* 0+1+2+10+11+12 = 36, + m[1][2]=12 */
+}
+int gsize(void){ int m[2][3]; return (int)sizeof(m); }   /* 2*3*4 = 24 */
+int gtag(void){ struct G g; g.cells[1][2] = 7; g.tag = 9; return g.cells[1][2] + g.tag; }
+int gstructsz(void){ return (int)sizeof(struct G); } /* 24 + 4 = 28 */
+" "
+#include <stdio.h>
+extern int grid(void), gsize(void), gtag(void), gstructsz(void);
+int main(void){
+  printf(\"%d %d %d %d\\n\", grid(), gsize(), gtag(), gstructsz());
+  return (grid()==48 && gsize()==24 && gtag()==16 && gstructsz()==28) ? 0 : 1;
+}
+")))
+    (should (equal "48 24 16 28" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-structtab-test)
 
 ;;; nelisp-cfront-structtab-test.el ends here
