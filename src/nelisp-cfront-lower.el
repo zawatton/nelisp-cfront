@@ -345,6 +345,48 @@ plus the NUL terminator (so `sizeof(zMagic)' is exact)."
           out)
       ty)))
 
+(defun nelisp-cfront-lower--eval-dim-dyn (expr)
+  "Evaluate an array-dimension EXPR to an integer using the current type
+env: `sizeof(EXPR)' resolves via `--type-of' (so `char z[sizeof(aGlobal)]'
+or `[sizeof(p->field)]' work), `sizeof(TYPE)' and arithmetic via the type
+sizer.  Signals `:non-constant-array-size' for a genuine VLA."
+  (cond
+   ((integerp expr) expr)
+   ((eq expr t) (nelisp-cfront-lower--err :non-constant-array-size t))
+   ((consp expr)
+    (pcase (car expr)
+      ('int (nth 1 expr))
+      ('cast (nelisp-cfront-lower--eval-dim-dyn (nth 2 expr)))
+      ('sizeof (nelisp-cfront-type-size (nth 1 expr) nelisp-cfront-lower--structs))
+      ('sizeof-expr
+       (nelisp-cfront-lower--type-size-dyn
+        (nelisp-cfront-lower--type-of (nth 1 expr))))
+      ('unop (let ((v (nelisp-cfront-lower--eval-dim-dyn (nth 2 expr))))
+               (pcase (nth 1 expr)
+                 ("-" (- v)) ("+" v) ("~" (lognot v)) ("!" (if (= v 0) 1 0))
+                 (_ (nelisp-cfront-lower--err :non-constant-array-size expr)))))
+      ('binop (let ((a (nelisp-cfront-lower--eval-dim-dyn (nth 2 expr)))
+                    (b (nelisp-cfront-lower--eval-dim-dyn (nth 3 expr))))
+                (pcase (nth 1 expr)
+                  ("+" (+ a b)) ("-" (- a b)) ("*" (* a b))
+                  ("/" (if (= b 0) 0 (/ a b))) ("%" (if (= b 0) 0 (% a b)))
+                  ("<<" (ash a b)) (">>" (ash a (- b)))
+                  ("&" (logand a b)) ("|" (logior a b)) ("^" (logxor a b))
+                  (_ (nelisp-cfront-lower--err :non-constant-array-size expr)))))
+      (_ (nelisp-cfront-lower--err :non-constant-array-size expr))))
+   (t (nelisp-cfront-lower--err :non-constant-array-size expr))))
+
+(defun nelisp-cfront-lower--type-size-dyn (ty)
+  "Byte size of TY, resolving a `sizeof'-based outer array dimension that
+the parser could not fold (via `--eval-dim-dyn' / the current tenv).  Falls
+back to the plain type sizer for integer / normal dims."
+  (let ((arr (plist-get ty :array)))
+    (if (and arr (not (integerp arr)) (not (eq arr t)))
+        (* (nelisp-cfront-lower--type-size-dyn
+            (nelisp-cfront-lower--strip-one-array ty))
+           (nelisp-cfront-lower--eval-dim-dyn arr))
+      (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
+
 (defun nelisp-cfront-lower--const-number (e)
   "Evaluate a constant numeric initializer E to an Elisp number (integer or
 float), supporting literals, casts, unary +/-, and +-*/ arithmetic.
@@ -953,8 +995,8 @@ so positions stay aligned to call arguments."
                  ,(nelisp-cfront-lower--expr (nth 3 e))))
     ('index (nelisp-cfront-lower--rvalue e))      ; element load (aggregate decays)
     ('sizeof (nelisp-cfront-lower--sizeof (nth 1 e)))
-    ('sizeof-expr (nelisp-cfront-type-size (nelisp-cfront-lower--type-of (nth 1 e))
-                                           nelisp-cfront-lower--structs))
+    ('sizeof-expr (nelisp-cfront-lower--type-size-dyn
+                   (nelisp-cfront-lower--type-of (nth 1 e))))
     ('cast (nelisp-cfront-lower--coerce             ; int<->double conversion; else identity
             (nelisp-cfront-lower--expr (nth 2 e))
             (nelisp-cfront-lower--expr-float-p (nth 2 e))
@@ -1743,8 +1785,8 @@ unchanged when no name is redeclared."
                                  (if mv
                                      ;; memory-backed: slot holds a frame block address
                                      (list 'frame-alloc
-                                           (nelisp-cfront-type-size
-                                            (cdr mv) nelisp-cfront-lower--structs))
+                                           (nelisp-cfront-lower--type-size-dyn
+                                            (cdr mv)))
                                    (list nelisp-cfront-lower--zero-fn)))))
                        locals))
          (synth-binds (mapcar (lambda (v) (list v (list nelisp-cfront-lower--zero-fn)))

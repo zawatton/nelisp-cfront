@@ -110,6 +110,30 @@ int main(void){
     (should (equal "111 40 4" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-structtab-sizeof-expr-array-dim-e2e ()
+  "A local array dimensioned by `sizeof(EXPR)' is sized at lower time using
+the type env: `sizeof(global)+N', `sizeof(param->field)', and the count
+idiom `sizeof(g)/sizeof(g[0])'."
+  (unless (nelisp-cfront-structtab-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-structtab-test--run "
+static const unsigned char magic[] = { 217, 213, 5, 249 };
+struct P { unsigned char ver[16]; int n; };
+int hdrsize(void){ unsigned char h[sizeof(magic) + 4]; h[0]=1; h[7]=2; return (int)sizeof(h); }
+int verbuf(struct P *p){ unsigned char b[sizeof(p->ver)]; b[0]=9; return (int)sizeof(b) + b[0]; }
+int tblcount(void){ int a[sizeof(magic)/sizeof(magic[0])]; a[0]=10; a[3]=20;
+  return (int)(sizeof(a)/sizeof(a[0])); }
+" "
+#include <stdio.h>
+struct P { unsigned char ver[16]; int n; };
+extern int hdrsize(void); extern int verbuf(struct P*); extern int tblcount(void);
+int main(void){ struct P p;
+  printf(\"%d %d %d\\n\", hdrsize(), verbuf(&p), tblcount());
+  return (hdrsize()==8 && verbuf(&p)==25 && tblcount()==4) ? 0 : 1; }
+")))
+    (should (equal "8 25 4" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-structtab-test)
 
 ;;; nelisp-cfront-structtab-test.el ends here

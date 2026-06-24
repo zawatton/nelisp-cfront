@@ -665,3 +665,21 @@ Result: `:non-constant-array-size' 12 → 5, coverage 98.2% → *98.5%*
 one `__builtin_offsetof' dim — these need a tenv-aware dimension evaluator
 at lower time (the dim's expr type is only known with the function's local
 type env), deferred.
+
+* §19 sizeof(EXPR) array dimensions (tenv-aware) — 98.5% → 98.6%
+
+The last `:non-constant-array-size` were local arrays dimensioned by
+`sizeof(EXPR)' the parser can't fold (the expr's type is only known with
+the function's type env): `char zHeader[sizeof(aJournalMagic)+4]',
+`b[sizeof(pPager->dbFileVers)]', `aRoot[sizeof(aTable)/sizeof(aTable[0])]'.
+
+Fix (lower-side, where the tenv exists): `--eval-dim-dyn' evaluates such a
+dim — `sizeof(EXPR)' via `--type-of' + the sizer, `sizeof(TYPE)' /
+arithmetic directly — and `--type-size-dyn' uses it for the outer dim.
+Wired into the frame-alloc sizing of memory-backed locals and into
+`sizeof-expr' lowering.
+
+Result: `:non-constant-array-size' 5 → 2, coverage 98.5% → *98.6%*
+(2358 / 2392).  The last 2 are an `__builtin_offsetof' array dim.
+Remaining tail (34): `:unknown-struct' 9 (anonymous tag-nil structs +
+Sublist), `:addr-of' 8, `:deref-non-pointer' 7, `:varargs' 7.
