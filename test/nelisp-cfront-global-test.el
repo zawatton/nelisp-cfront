@@ -174,6 +174,31 @@ int main(void){
     (should (equal "15 15 3 6 7 90 7" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-global-pointer-string-init-e2e ()
+  "Step C-2: a pointer global initialized with a string literal, and a flat
+array of string pointers, resolve via `.data' relocations to the rodata
+string pool and read back correctly."
+  (unless (nelisp-cfront-global-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-global-test--run "
+const char *greeting = \"hello\";
+const char *names[3] = { \"alpha\", \"beta\", \"gamma\" };
+const char *get_greeting(void){ return greeting; }
+const char *get_name(int i){ return names[i]; }
+" "
+#include <stdio.h>
+#include <string.h>
+extern const char *get_greeting(void);
+extern const char *get_name(int);
+int main(void){
+  printf(\"%s %s %s %s\\n\", get_greeting(), get_name(0), get_name(1), get_name(2));
+  return (strcmp(get_greeting(),\"hello\")==0 && strcmp(get_name(0),\"alpha\")==0 &&
+          strcmp(get_name(1),\"beta\")==0 && strcmp(get_name(2),\"gamma\")==0) ? 0 : 1;
+}
+")))
+    (should (equal "hello alpha beta gamma" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-global-test)
 
 ;;; nelisp-cfront-global-test.el ends here

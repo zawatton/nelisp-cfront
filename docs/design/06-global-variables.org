@@ -142,15 +142,37 @@ calls, pointer global, const stays read-only; 71/71 suite green).
 =lower-gap=: =:unknown-struct= 148 → 121, coverage 86.7% → 87.8% (2073 →
 2100 / 2392).
 
-*Deferred to a follow-on (Step C-2 / "data relocations")*: globals with a
-*non-zero aggregate* initializer (positional/designated struct inits,
-arrays of structs) and globals whose initializer embeds a *pointer*
-(=zName= string-literal fields in =aXformType[]=, =&otherGlobal=).  The
-latter needs per-blob relocations inside =.data= (a string/global address
-baked into the blob), a capability =data-blob= does not yet have.  These
-dominate the residual =:unknown-struct= / =:addr-of-non-memory-var= /
-=:deref-non-pointer= buckets.  Separately, some =:unknown-struct= are not
-globals at all but incomplete/forward-declared struct *types* (e.g. a
+** Step C-2 — data relocations: pointer globals (string pool) [DONE 2026-06-24]
+*Upstream* (=nelisp-elf-write= + =nelisp-aot-compiler=): per-blob
+relocations.  =data-blob= gains an optional 5th arg RELOCS =((OFFSET
+TARGET-SYM ADDEND) ...)=; =compile-to-link-unit= shifts each by the blob's
+=.data= offset and emits an =abs64= reloc tagged =:section data=.  The ELF
+writer now splits relocs by section into =.rela.text= and a new
+=.rela.data= (=--build-rel=: =text-relocs= / =data-relocs=, a shared
+=sym-idx-table=, a =.rela.data= shdr with =sh_info= = the =.data= index).
+A =preprocess-source= fix passes =data-blob= through untouched so a =nil=
+RELOCS is not rewritten to =0= by the host-nil rule.  Verified raw (ERT
+=data-blob-pointer-reloc-e2e=): an 8-byte =.data= pointer relocated to a
+=.rodata= string blob, read back as "hi!".
+
+*cfront*: a pointer global initialized with a *string literal* — scalar
+(=const char *g = "hi";=) or a flat array (=const char *t[] = {"a","b"};=)
+— is interned into the string pool and emitted as a =.data= blob whose
+pointer slots carry =abs64= relocs to the pool symbols
+(=--pointer-init-cell= / =--pointer-array-image=; the string pool is now
+bound before =--collect-globals=).  Verified: ERT
+=nelisp-cfront-global-pointer-string-init-e2e= ("hello alpha beta gamma";
+72/72 suite green).  =lower-gap=: coverage 87.8% → 88.0% (2100 → 2106).
+
+*Still deferred*: globals with a *non-zero struct/array aggregate*
+initializer that is not a flat pointer array (e.g. =aXformType[]= = an
+array of structs with =float= fields and an inline =char[7]= — needs
+recursive field/element byte layout incl. IEEE-754 + inline char arrays,
+no relocs) and =&otherGlobal= pointer initializers (reloc to a data
+symbol, same machinery, needs the target to be a collected global).  The
+parser also discards designated initializers (=.f=/=[i]=), so only
+positional aggregates are layoutable.  Separately, some =:unknown-struct=
+are not globals but incomplete/forward-declared struct *types* (e.g. a
 =sqlite3*= parameter) — a struct-completeness issue, not a global one.
 
 ** Step D — string literals (=:string-literal=, 282)  [DONE 2026-06-24]

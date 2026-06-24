@@ -298,37 +298,94 @@ when it is a local, which is harmless since locals are not globals)."
       (walk ast))
     (delete-dups acc)))
 
+(defun nelisp-cfront-lower--pointer-init-cell (expr)
+  "Lower one pointer-typed initializer EXPR to (BYTES . RELOC): BYTES is 8
+bytes and RELOC is (BYTE-OFFSET TARGET-SYM ADDEND) or nil.  Handles a
+string literal (interned into the rodata string pool, Step C-2) and an
+integer constant (raw pointer bits, e.g. NULL).  Returns nil if
+unsupported (e.g. `&global', a non-constant address — deferred)."
+  (cond
+   ((and (consp expr) (eq (car expr) 'cast))
+    (nelisp-cfront-lower--pointer-init-cell (nth 2 expr)))
+   ((and (consp expr) (eq (car expr) 'str))
+    (cons (make-string 8 0)
+          (list 0 (nelisp-cfront-lower--intern-string (nth 1 expr)) 0)))
+   (t (condition-case nil
+          (cons (nelisp-cfront-lower--pack-int
+                 (nelisp-cfront-parse--const-eval expr) 8)
+                nil)
+        (error nil)))))
+
+(defun nelisp-cfront-lower--pointer-array-image (ty init)
+  "Image (data BYTES RELOCS) for a flat array-of-pointers global with an
+init-list INIT (each element a string literal or integer constant), or nil
+if any element is an unsupported pointer initializer."
+  (let* ((arr (plist-get ty :array))
+         (elts (cdr init))
+         (declared (and (integerp arr) arr))
+         (count (or declared (length elts)))
+         (bytes (make-string (* count 8) 0))
+         (relocs nil) (i 0) (ok t))
+    (dolist (e elts)
+      (when (and ok (< i count))
+        (let ((cell (nelisp-cfront-lower--pointer-init-cell e)))
+          (if (null cell)
+              (setq ok nil)
+            (let ((cb (car cell)))
+              (dotimes (b 8) (aset bytes (+ (* i 8) b) (aref cb b))))
+            (when (cdr cell)
+              (push (list (+ (* i 8) (nth 0 (cdr cell)))
+                          (nth 1 (cdr cell)) (nth 2 (cdr cell)))
+                    relocs)))))
+      (setq i (1+ i)))
+    (and ok (list 'data bytes (nreverse relocs)))))
+
 (defun nelisp-cfront-lower--global-image (ty init written-p)
-  "Return (SECTION . BYTES) for a global of type TY with initializer INIT,
-or nil when this step cannot lay it out.  SECTION is `rodata' (read-only
-const integer), `data' (writable, initialized), or `bss' (writable,
-zero-filled — BYTES is a zero placeholder whose length is the reserved
-size).  WRITTEN-P forces a writable section."
+  "Return (SECTION BYTES RELOCS) for a global of type TY with initializer
+INIT, or nil when this step cannot lay it out.  SECTION is `rodata'
+(read-only const integer), `data' (writable / reloc-bearing), or `bss'
+(zero-filled, BYTES a placeholder whose length is the reserved size).
+RELOCS is a list of (BYTE-OFFSET TARGET-SYM ADDEND) for pointers baked
+into the blob.  WRITTEN-P forces a writable section."
   (let ((const-bytes (ignore-errors
-                       (nelisp-cfront-lower--global-bytes ty init))))
+                       (nelisp-cfront-lower--global-bytes ty init)))
+        (arr (plist-get ty :array))
+        (ptr (or (plist-get ty :ptr) 0)))
     (cond
      ;; const integer scalar / flat array with a computable image.
      (const-bytes
       (cond
-       ((not written-p) (cons 'rodata const-bytes))
-       ((nelisp-cfront-lower--bytes-all-zero-p const-bytes) (cons 'bss const-bytes))
-       (t (cons 'data const-bytes))))
-     ;; absent / all-zero initializer of any sized type (struct, pointer,
-     ;; scalar, array) -> reserve zero-filled .bss.
+       ((not written-p) (list 'rodata const-bytes nil))
+       ((nelisp-cfront-lower--bytes-all-zero-p const-bytes) (list 'bss const-bytes nil))
+       (t (list 'data const-bytes nil))))
+     ;; Step C-2: a scalar pointer initialized with a string literal / const
+     ;; -> 8 bytes (+ a .data reloc for the string).
+     ((and init (null arr) (> ptr 0)
+           (not (nelisp-cfront-lower--init-all-zero-p init)))
+      (let ((cell (nelisp-cfront-lower--pointer-init-cell init)))
+        (and cell (list 'data (car cell)
+                        (and (cdr cell) (list (cdr cell)))))))
+     ;; Step C-2: a flat array of pointers initialized with string/const
+     ;; elements -> N*8 bytes + a reloc per string element.
+     ((and (consp init) (eq (car init) 'init-list) arr
+           (let ((ety (nelisp-cfront-type--strip-array ty)))
+             (and (null (plist-get ety :array))
+                  (> (or (plist-get ety :ptr) 0) 0))))
+      (nelisp-cfront-lower--pointer-array-image ty init))
+     ;; absent / all-zero initializer of any sized type -> zero-filled .bss.
      ((nelisp-cfront-lower--init-all-zero-p init)
       (let ((sz (ignore-errors
                   (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
-        (and (integerp sz) (> sz 0) (cons 'bss (make-string sz 0)))))
-     ;; non-zero, non-const-integer initializer (struct/array aggregate,
-     ;; pointer arrays, string-into-pointer) -> not handled yet.
+        (and (integerp sz) (> sz 0) (list 'bss (make-string sz 0) nil))))
+     ;; non-zero struct/array aggregate initializer -> not handled yet.
      (t nil))))
 
 (defun nelisp-cfront-lower--collect-globals (ast)
-  "Return an alist NAME->(:type TY :section SECT :bytes UNIBYTE) for the
-program's globals this step can place: read-only const integers (rodata),
-writable const integers (data/bss), and zero/uninitialized scalars,
-pointers, structs, and arrays (bss).  Globals with a non-zero
-struct/pointer-array initializer are skipped (future work)."
+  "Return an alist NAME->(:type TY :section SECT :bytes UNIBYTE :relocs R)
+for the program's globals this step can place: read-only const integers
+(rodata); writable const integers and reloc-bearing pointer scalars/arrays
+(data); and zero/uninitialized scalars, pointers, structs, arrays (bss).
+Globals with a non-zero struct/array aggregate initializer are skipped."
   (let ((written (nelisp-cfront-lower--collect-written-globals ast))
         (out nil))
     (dolist (top (cdr ast))
@@ -338,7 +395,8 @@ struct/pointer-array initializer are skipped (future work)."
             (let ((img (nelisp-cfront-lower--global-image
                         ty init (and (member name written) t))))
               (when img
-                (push (cons name (list :type ty :section (car img) :bytes (cdr img)))
+                (push (cons name (list :type ty :section (nth 0 img)
+                                       :bytes (nth 1 img) :relocs (nth 2 img)))
                       out)))))))
     (nreverse out)))
 
@@ -1318,14 +1376,15 @@ skipped in the MVP (functions only)."
   (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
          (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
          (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
-         ;; Read-only integer globals (Doc 06 Step B): collected once (needs
-         ;; `--structs' for element sizing), exposed to every function's type
-         ;; env, and emitted as `data-blob' rodata symbols below.
-         (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
-         ;; String literal pool (Doc 06 Step D): filled while lowering the
-         ;; function bodies below, emitted as rodata `data-blob's afterward.
+         ;; String literal pool (Doc 06 Step D): bound first so a pointer
+         ;; global initialized with a string literal (Step C-2) can intern
+         ;; it during `--collect-globals'; also filled while lowering bodies.
          (nelisp-cfront-lower--string-pool nil)
          (nelisp-cfront-lower--string-counter 0)
+         ;; Globals (Doc 06 Step B/C/C-2): collected once (needs `--structs'
+         ;; for sizing and the string pool for pointer relocs), exposed to
+         ;; every function's type env, emitted as `data-blob's below.
+         (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
          (nelisp-cfront-lower--uses-float nil)
          (funcs nil))
     (dolist (top (cdr ast))
@@ -1343,7 +1402,8 @@ skipped in the MVP (functions only)."
            (mapcar (lambda (g)
                      `(data-blob ,(intern (car g))
                                  ,(plist-get (cdr g) :bytes)
-                                 ,(plist-get (cdr g) :section)))
+                                 ,(plist-get (cdr g) :section)
+                                 ,(plist-get (cdr g) :relocs)))
                    nelisp-cfront-lower--globals)
            (mapcar (lambda (e)
                      `(data-blob ,(cdr e)
