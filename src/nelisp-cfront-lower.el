@@ -1673,9 +1673,11 @@ ENV maps a C name to its current unique name."
             (nelisp-cfront-lower--rs (nth 2 node) e2 multi)
             (nelisp-cfront-lower--rs (nth 3 node) e2 multi)
             (nelisp-cfront-lower--rs (nth 4 node) e2 multi))))
-   (t (cons (car node)
-            (mapcar (lambda (x) (nelisp-cfront-lower--rs x env multi))
-                    (cdr node))))))
+   ;; Map over EVERY element (not just the cdr): a node's head is usually a
+   ;; tag symbol (returned unchanged), but a plain list — e.g. a call's
+   ;; argument list `((& x) y ...)' — has a sub-node in its car too, which
+   ;; must be rewritten (otherwise the first call argument escaped renaming).
+   (t (mapcar (lambda (x) (nelisp-cfront-lower--rs x env multi)) node))))
 
 (defun nelisp-cfront-lower--rename-shadowed (body params)
   "Rename multiply-declared locals in BODY so each declaration scope gets a
