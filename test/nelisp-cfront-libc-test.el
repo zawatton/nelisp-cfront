@@ -60,6 +60,40 @@ int main(void){
     (should (equal "AAAAA AAAAA 5 0 -1 hi 0" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-libc-extern-call-e2e ()
+  "A cfront-compiled function may CALL the real libc: a name that is
+declared (a prototype) or implicitly declared but not defined in the unit
+lowers to a PLT `extern-call', which the linker resolves against libc.
+Here `mydup' calls strlen+malloc+memcpy, and the verbatim real-SQLite
+`sqlite3Strlen30' calls strlen — both run correctly."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef unsigned long u64;
+extern u64 strlen(const char *);
+extern void *memcpy(void *, const void *, u64);
+extern void *malloc(u64);
+char *mydup(const char *s){ u64 n = strlen(s)+1; char *p=(char*)malloc(n); memcpy(p,s,n); return p; }
+int sqlite3Strlen30(const char *z){ if( z==0 ) return 0; return 0x3fffffff & (int)strlen(z); }
+")
+         (drv "
+#include <stdio.h>
+#include <string.h>
+extern char *mydup(const char *);
+extern int sqlite3Strlen30(const char *);
+int main(void){
+  char *d = mydup(\"hello, libc!\");
+  int l = sqlite3Strlen30(\"SELECT * FROM t;\");
+  int z = sqlite3Strlen30(0);
+  int ok = (strcmp(d,\"hello, libc!\")==0) && (l==16) && (z==0);
+  printf(\"%s %d %d %s\\n\", d, l, z, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "hello, libc! 16 0 OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here

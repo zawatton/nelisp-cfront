@@ -48,6 +48,11 @@ helpers; `lower-program' then prepends the helper defuns.")
 (defvar nelisp-cfront-lower--func-params nil
   "Function parameter-type table (name->list-of-param-types) for the
 program, used to coerce call arguments between int and double-bits.")
+(defvar nelisp-cfront-lower--defined-funcs nil
+  "Names (strings) of functions DEFINED in this unit (have a `func' body).
+A called name that is a known function but NOT in this set is an extern
+(prototype-only or implicitly-declared) symbol, lowered to a PLT
+`extern-call' rather than a same-unit direct call.")
 (defvar nelisp-cfront-lower--tenv nil
   "Type environment (var-name->type) for the current function.")
 (defvar nelisp-cfront-lower--synth nil
@@ -989,6 +994,15 @@ references then fall back to the old frame path / fail as before)."
         (push (cons (nth 2 top) (nth 1 top)) acc)))
     acc))
 
+(defun nelisp-cfront-lower--collect-defined-funcs (program)
+  "List of NAMEs of functions DEFINED (a `func' body) in PROGRAM.
+Used to tell a same-unit direct call from an extern (PLT) call."
+  (let ((acc nil))
+    (dolist (top (cdr program))
+      (when (eq (car top) 'func)
+        (push (nth 2 top) acc)))
+    acc))
+
 (defun nelisp-cfront-lower--collect-func-params (program)
   "Alist NAME -> list of param TYPEs (positional) for `func'/`proto'.
 The lone `(void)' marker is dropped; unnamed prototype params are kept
@@ -1247,20 +1261,52 @@ matches C, so the raw value is used directly."
                        g))))
 
 (defun nelisp-cfront-lower--call (fn args)
-  (if (and (eq (car fn) 'var)
-           (nelisp-cfront-lower--var-is-function-p (nth 1 fn)))
-      ;; direct call to a named function: coerce args to the param types
-      (let* ((name (nth 1 fn))
-             (ptypes (cdr (assoc name nelisp-cfront-lower--func-params))))
-        (cons (nelisp-cfront-lower--sym name)
-              (nelisp-cfront-lower--call-args args ptypes)))
-    ;; indirect call through a function-pointer value: fp(...) / (*fp)(...)
-    ;; (param types are not tracked for fn-ptrs; pass args uncoerced)
+  (cond
+   ;; direct call to a function DEFINED in this unit: coerce args to the
+   ;; declared param types and call the same-unit grammar defun.
+   ((and (eq (car fn) 'var)
+         (nelisp-cfront-lower--var-is-function-p (nth 1 fn))
+         (member (nth 1 fn) nelisp-cfront-lower--defined-funcs))
+    (let* ((name (nth 1 fn))
+           (ptypes (cdr (assoc name nelisp-cfront-lower--func-params))))
+      (cons (nelisp-cfront-lower--sym name)
+            (nelisp-cfront-lower--call-args args ptypes))))
+   ;; call to an EXTERN function: a name that is not a local variable, not a
+   ;; global variable (a global fn-ptr would call-ptr below), and not defined
+   ;; here — a declared prototype (libc: memcpy, strlen, ...) or an
+   ;; implicitly-declared name.  Emit a PLT `extern-call' (the linker resolves
+   ;; the bare C symbol against libc / other objects).
+   ((and (eq (car fn) 'var)
+         (not (assoc (nth 1 fn) nelisp-cfront-lower--tenv))
+         (not (nelisp-cfront-lower--global-var-p (nth 1 fn))))
+    (nelisp-cfront-lower--extern-call (nth 1 fn) args))
+   ;; indirect call through a function-pointer value: fp(...) / (*fp)(...)
+   ;; (param types are not tracked for fn-ptrs; pass args uncoerced)
+   (t
     (let ((target (if (and (eq (car fn) 'unop) (string= (nth 1 fn) "*"))
                       (nth 2 fn)
                     fn))
           (gargs (mapcar #'nelisp-cfront-lower--expr args)))
-      (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs)))))
+      (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs))))))
+
+(defun nelisp-cfront-lower--extern-call (name args)
+  "Lower a call to extern function NAME (resolved by the linker via PLT).
+ARGS are passed positionally; a `double'/`float' argument is tagged `:f64'
+(its IEEE-bits value moved to an xmm reg by the back-end), every other
+argument (int / pointer) is a bare GP value.  The result class follows the
+declared return type: a float/double return uses `extern-call-f64'.
+NOTE: variadic calls are not specially marked yet — extra args ride the
+same register classes, which is correct for integer/pointer varargs."
+  (let* ((ret-ty (cdr (assoc name nelisp-cfront-lower--funcs)))
+         (ret-f64 (and ret-ty (nelisp-cfront-float-type-p ret-ty)))
+         (gargs (mapcar
+                 (lambda (a)
+                   (if (nelisp-cfront-lower--expr-float-p a)
+                       (list :f64 (nelisp-cfront-lower--as-double-bits a))
+                     (nelisp-cfront-lower--expr a)))
+                 args)))
+    (cons (if ret-f64 'extern-call-f64 'extern-call)
+          (cons (intern name) gargs))))
 
 (defun nelisp-cfront-lower--incdec (e)
   "Lower ++/-- (pre or post) on ANY lvalue by desugaring to
@@ -1954,6 +2000,7 @@ a real-world C file emits the functions that DO lower."
   (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
          (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
          (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
+         (nelisp-cfront-lower--defined-funcs (nelisp-cfront-lower--collect-defined-funcs ast))
          ;; String literal pool (Doc 06 Step D): bound first so a pointer
          ;; global initialized with a string literal (Step C-2) can intern
          ;; it during `--collect-globals'; also filled while lowering bodies.
