@@ -50,6 +50,7 @@
     (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
            (nelisp-cfront-lower--funcs (nelisp-cfront-lower--collect-func-types ast))
            (nelisp-cfront-lower--defined-funcs (nelisp-cfront-lower--collect-defined-funcs ast))
+           (nelisp-cfront-lower--variadic-funcs (nelisp-cfront-lower--collect-variadic-funcs ast))
            (nelisp-cfront-lower--func-params (nelisp-cfront-lower--collect-func-params ast))
            (nelisp-cfront-lower--string-pool nil)
            (nelisp-cfront-lower--string-counter 0)

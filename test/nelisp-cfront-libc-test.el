@@ -174,6 +174,37 @@ int main(void){
     (should (equal "cdab 44332211 807060504030201 12345678 OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-variadic-extern-call-e2e ()
+  "A cfront-compiled function may call a VARIADIC libc function: the args
+past the fixed parameters are marked `:varargs' so the back-end sets the
+SysV AL register (without it the call faults).  Exercises integer + string
+varargs via `snprintf' (deterministic buffer output)."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+extern int snprintf(char *, unsigned long, const char *, ...);
+int fmt2(char *b, unsigned long n, int a, int c){ return snprintf(b, n, \"%d+%d=%d\", a, c, a+c); }
+int fmts(char *b, unsigned long n, const char *s, int k){ return snprintf(b, n, \"[%s:%d]\", s, k); }
+")
+         (drv "
+#include <stdio.h>
+#include <string.h>
+extern int fmt2(char*, unsigned long, int, int);
+extern int fmts(char*, unsigned long, const char*, int);
+int main(void){
+  char a[32], b[32];
+  int na = fmt2(a, sizeof a, 3, 4);          /* \"3+4=7\", 5 */
+  int nb = fmts(b, sizeof b, \"id\", 42);      /* \"[id:42]\", 7 */
+  int ok = (strcmp(a,\"3+4=7\")==0) && (na==5)
+        && (strcmp(b,\"[id:42]\")==0) && (nb==7);
+  printf(\"%s|%s|%d|%d|%s\\n\", a, b, na, nb, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "3+4=7|[id:42]|5|7|OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here
