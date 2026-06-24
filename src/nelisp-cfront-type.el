@@ -125,31 +125,53 @@ Returns (:size N :align A :fields ALIST)."
           :align align
           :fields (nreverse alist))))
 
+(defun nelisp-cfront-type--scan-inline (ty structs)
+  "Register every inline struct/union definition reachable from type TY into
+STRUCTS (an alist TAG->layout), innermost first, so a tag defined inside
+another struct's member list — or at a global / parameter declaration —
+becomes resolvable by name.  Returns the updated alist.  Tolerant: a
+struct whose layout can't yet be computed is skipped, not fatal."
+  (when (consp ty)
+    (let ((fields (plist-get ty :fields)))
+      (when fields
+        ;; register inline structs in the member types first (innermost)
+        (dolist (f fields)
+          (setq structs (nelisp-cfront-type--scan-inline (nth 1 f) structs)))
+        (let ((tag (plist-get ty :struct)))
+          (when (and tag (not (assoc tag structs)))
+            (condition-case nil
+                (setq structs
+                      (cons (cons tag (nelisp-cfront-type-layout
+                                       fields structs (plist-get ty :union)))
+                            structs))
+              (nelisp-cfront-type-error nil)))))))
+  structs)
+
 (defun nelisp-cfront-type-build-structs (program)
   "Build the struct table from PROGRAM `(program TOP...)'.
-Also scans inline `:fields' on struct types in params/decls."
+Scans inline `:fields' struct/union definitions wherever they appear —
+top-level `struct-def' / `typedef', a `global' declaration, a function's
+return/parameter types, and *nested* inside another struct's members — so
+a tag is resolvable even when its only definition is inline at a sibling
+declaration (e.g. `static struct T {...} a;' then `struct T b;')."
   (let ((structs nil))
     (dolist (top (cdr program))
       (pcase (car top)
         ('struct-def
          (let ((name (nth 1 top)) (fields (nth 2 top)) (union-p (nth 3 top)))
-           (when (and name fields)
-             ;; Tolerant: a struct whose layout can't yet be computed
-             ;; (e.g. an anonymous struct-by-value member) is skipped, not
-             ;; fatal — functions that need it fail individually at lower
-             ;; time rather than blocking the whole program.
-             (condition-case nil
-                 (push (cons name (nelisp-cfront-type-layout fields structs union-p))
-                       structs)
-               (nelisp-cfront-type-error nil)))))
+           (when fields
+             (setq structs (nelisp-cfront-type--scan-inline
+                            (list :base 'struct :struct name :fields fields
+                                  :union union-p)
+                            structs)))))
         ('typedef
-         (let* ((ty (nth 2 top)) (name (plist-get ty :struct))
-                (fields (plist-get ty :fields)) (union-p (plist-get ty :union)))
-           (when (and name fields)
-             (condition-case nil
-                 (push (cons name (nelisp-cfront-type-layout fields structs union-p))
-                       structs)
-               (nelisp-cfront-type-error nil)))))
+         (setq structs (nelisp-cfront-type--scan-inline (nth 2 top) structs)))
+        ('global
+         (setq structs (nelisp-cfront-type--scan-inline (nth 1 top) structs)))
+        ((or 'func 'proto)
+         (setq structs (nelisp-cfront-type--scan-inline (nth 1 top) structs))
+         (dolist (p (nth 3 top))
+           (setq structs (nelisp-cfront-type--scan-inline (nth 1 p) structs))))
         (_ nil)))
     structs))
 

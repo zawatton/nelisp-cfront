@@ -574,3 +574,24 @@ exactly the address-taken-local path, extended to params.
 Result: =:addr-of-non-memory-var= 27 → 11, coverage 95.6% → *96.2%*
 (2301 / 2392).  The residual 11 are =&global= on designated-initializer
 globals (need parser designator preservation + by-name =--lay= placement).
+
+* §15 struct-table completeness: 96.2% → 98.0% (2026-06-24)
+
+Chasing the `&global' tail of `:addr-of-non-memory-var' (io-method tables)
+revealed those globals were *positional*, not designated — and the real
+blocker was the *struct table*.  `build-structs' only scanned top-level
+`struct-def' / `typedef', so a tag defined inline *inside another struct's
+members* (=struct ExprList_item= nested in =struct ExprList=) or *at a
+sibling global decl* (=struct sqlite3PrngType= defined at =sqlite3Prng=,
+referenced by =sqlite3SavedPrng=) was never registered — so any global or
+expression of that type failed (=:unknown-struct= / unsizeable global ->
+=&= / member access).
+
+Fix (=nelisp-cfront-type=): a recursive =--scan-inline= registers every
+inline struct/union definition reachable from a type — nested in members,
+and at every =global= / =func= return+param type — innermost first.
+
+Result: =:unknown-struct= 47 → *5*, =:addr-of-non-memory-var= 11 → 6,
+coverage 96.2% → *98.0%* (2345 / 2392).  Remaining 47 are now a small
+mixed tail: =:non-constant-array-size= 13 (VLAs), =:deref-non-pointer= 8,
+=:varargs= 7, =:unknown-field= 7, =:addr-of= 6, =:unknown-struct= 5.
