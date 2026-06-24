@@ -461,6 +461,17 @@ unsupported (e.g. `&global', a non-constant address — deferred)."
    ((and (consp expr) (eq (car expr) 'str))
     (cons (make-string 8 0)
           (list 0 (nelisp-cfront-lower--intern-string (nth 1 expr)) 0)))
+   ;; A named function as a pointer value (a function-pointer table entry):
+   ;; `(cast)f', bare `f', or `&f' all decay to f's address -> an abs64
+   ;; reloc to the function symbol.  Restricted to KNOWN functions so the
+   ;; reloc target is always resolvable (a same-unit defun or a libc UND).
+   ((and (consp expr) (eq (car expr) 'var)
+         (assoc (nth 1 expr) nelisp-cfront-lower--funcs))
+    (cons (make-string 8 0) (list 0 (intern (nth 1 expr)) 0)))
+   ((and (consp expr) (eq (car expr) 'unop) (equal (nth 1 expr) "&")
+         (eq (car-safe (nth 2 expr)) 'var)
+         (assoc (nth 1 (nth 2 expr)) nelisp-cfront-lower--funcs))
+    (cons (make-string 8 0) (list 0 (intern (nth 1 (nth 2 expr))) 0)))
    (t (condition-case nil
           (cons (nelisp-cfront-lower--pack-int
                  (nelisp-cfront-parse--const-eval expr) 8)
@@ -1055,13 +1066,24 @@ matches C, so the raw value is used directly."
 covers var / p->f / a[i] / *p / bitfield / address-taken scalar, and —
 because the `+'/`-' goes through `--binop' — gets pointer-arithmetic
 scaling (=p++= advances by the pointee size) and float (=d++= adds 1.0)
-right.  Returns the new value (the assigned value); a post-increment in
-value position thus yields the new value in this MVP, exact in statement
-position (the dominant case).  TARGET is re-read for the binop, so an
-lvalue with a side-effecting subexpression (=a[i++]++=) is not modelled."
-  (let ((target (nth 2 e))
-        (op (if (string= (nth 1 e) "++") "+" "-")))
-    (nelisp-cfront-lower--assign "=" target (list 'binop op target '(int 1)))))
+right.
+
+A *pre*-increment yields the new value (= the assignment's value).  A
+*post*-increment must yield the value *before* the update, which matters
+in value position (=*p++=, =a[i++]=): the old value is captured into a
+fresh temp, the target is updated, then the temp is returned.  TARGET is
+re-read for the update, so an lvalue with a side-effecting subexpression
+\(=a[i++]++=) is still not modelled."
+  (let* ((target (nth 2 e))
+         (op (if (string= (nth 1 e) "++") "+" "-"))
+         (update (nelisp-cfront-lower--assign
+                  "=" target (list 'binop op target '(int 1)))))
+    (if (eq (car e) 'pre)
+        update
+      ;; post: (let ((tmp OLD)) (seq UPDATE tmp))
+      (let ((tmp (nelisp-cfront-lower--gensym "pinc")))
+        `(let ((,tmp ,(nelisp-cfront-lower--expr target)))
+           ,(nelisp-cfront-lower--seq (list update tmp)))))))
 
 (defun nelisp-cfront-lower--sizeof (ty)
   (let ((ptr (plist-get ty :ptr)))

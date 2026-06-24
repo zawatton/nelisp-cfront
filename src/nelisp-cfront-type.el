@@ -245,6 +245,9 @@ TENV is an alist NAME->type (params + locals); FUNCS is NAME->ret-type."
          (nelisp-cfront-type-double))
         (t (nelisp-cfront-type-long)))))
     ('assign (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
+    ;; pre/post ++/-- yield the operand's type (so `*p++' keeps `p's
+    ;; pointer type instead of defaulting to `long').
+    ((or 'pre 'post) (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('ternary (nelisp-cfront-type-of (nth 2 expr) tenv structs funcs))
     ('cast (nth 1 expr))                ; a cast yields the cast-to type
     ((or 'sizeof 'sizeof-expr) (nelisp-cfront-type-long))

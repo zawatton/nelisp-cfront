@@ -75,6 +75,60 @@ int main(void){
     (should (equal "60 -1" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-scope-deref-postincr-e2e ()
+  "`*p++' over a pointer keeps the pointer type (type-of pre/post), so the
+deref loads through it instead of signalling `:deref-non-pointer'."
+  (unless (nelisp-cfront-scope-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-scope-test--run "
+int sumbytes(const unsigned char *p, int n){
+  int s = 0;
+  while(n-- > 0){ s += *p++; }
+  return s;
+}
+" "
+#include <stdio.h>
+extern int sumbytes(const unsigned char*, int);
+int main(void){
+  unsigned char a[5] = {10,20,30,40,200};
+  printf(\"%d\\n\", sumbytes(a,5));
+  return sumbytes(a,5)==300 ? 0 : 1;
+}
+")))
+    (should (equal "300" (cdr res)))
+    (should (= 0 (car res)))))
+
+(ert-deftest nelisp-cfront-scope-function-pointer-table-e2e ()
+  "A static struct array with string + function-pointer fields lays out via
+.data relocations (string pool + function symbols), read back by value."
+  (unless (nelisp-cfront-scope-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-scope-test--run "
+typedef int (*fp)(int);
+int dbl(int x){ return x*2; }
+int neg(int x){ return 0-x; }
+static struct { const char *name; fp f; int tag; } tbl[2] = {
+  { \"dbl\", (fp)dbl, 7 },
+  { \"neg\", (fp)neg, 9 },
+};
+long getf(int i){ return (long)tbl[i].f; }
+const char *nameof(int i){ return tbl[i].name; }
+int tagof(int i){ return tbl[i].tag; }
+" "
+#include <stdio.h>
+#include <string.h>
+typedef int (*fp)(int);
+extern long getf(int); extern const char *nameof(int); extern int tagof(int);
+int main(void){
+  fp f0=(fp)getf(0), f1=(fp)getf(1);
+  printf(\"%d %d %s %s %d %d\\n\", f0(5), f1(5), nameof(0), nameof(1), tagof(0), tagof(1));
+  return (f0(5)==10 && f1(5)==-5 && strcmp(nameof(0),\"dbl\")==0 &&
+          strcmp(nameof(1),\"neg\")==0 && tagof(0)==7 && tagof(1)==9) ? 0 : 1;
+}
+")))
+    (should (equal "10 -5 dbl neg 7 9" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-scope-test)
 
 ;;; nelisp-cfront-scope-test.el ends here

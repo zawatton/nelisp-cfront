@@ -508,3 +508,30 @@ Residual buckets are now smaller and mixed: =:deref-non-pointer= 66,
 =:unknown-struct= 49 (a true incomplete-type tail + a few globals still
 skipped), =:addr-of-non-memory-var= 40, =:non-constant-array-size= 37,
 =:varargs= 7.
+
+* §12 =:deref-non-pointer= sweep: 91% → 94.5% (2026-06-24)
+
+Precise per-expr diagnosis (advise =type-of=, capture the innermost expr
+that signals) split the 66 =:deref-non-pointer= into three real causes:
+
+- =*p++= / =*++p= (≈23): =type-of= had no =pre=/=post= arm, so the
+  post-increment typed as =long= and the deref failed.  Added
+  =((or 'pre 'post) (type-of operand))=: +22 functions.  *And* the
+  post-increment *value* was wrong (=--incdec= returned the new value in
+  value position, so =*p++= read =*(p+1)=) — fixed to capture the old
+  value into a temp before the update, so =*p++= is now exact.
+
+- =aSyscall[i]= and other *function-pointer tables* (≈42): a file-static
+  =struct { const char *zName; sqlite3_syscall_ptr p; ... } aSyscall[]= =
+  ={{"open",(ptr)posixOpen,0}, ...}= was skipped (=--lay= couldn't encode
+  a function-pointer field).  Now =--pointer-init-cell= turns a named
+  function (=(cast)f=, =&f=, bare =f= for any function in =--funcs=) into
+  an =abs64= reloc to the function symbol, and upstream =extern-names=
+  includes =.rela.data= targets (so a libc =close= becomes an UND extern;
+  a same-unit =posixOpen= resolves to its GLOBAL FUNC symbol): +52
+  functions.
+
+Result: =:deref-non-pointer= 66 → 2, coverage 92.3% → *94.5%* (2261 /
+2392).  Remaining top buckets: =:unknown-struct= 48 (true incomplete-type
+tail), =:non-constant-array-size= 41, =:addr-of-non-memory-var= 27,
+=:varargs= 7.
