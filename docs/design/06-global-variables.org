@@ -164,16 +164,40 @@ bound before =--collect-globals=).  Verified: ERT
 =nelisp-cfront-global-pointer-string-init-e2e= ("hello alpha beta gamma";
 72/72 suite green).  =lower-gap=: coverage 87.8% → 88.0% (2100 → 2106).
 
-*Still deferred*: globals with a *non-zero struct/array aggregate*
-initializer that is not a flat pointer array (e.g. =aXformType[]= = an
-array of structs with =float= fields and an inline =char[7]= — needs
-recursive field/element byte layout incl. IEEE-754 + inline char arrays,
-no relocs) and =&otherGlobal= pointer initializers (reloc to a data
-symbol, same machinery, needs the target to be a collected global).  The
-parser also discards designated initializers (=.f=/=[i]=), so only
-positional aggregates are layoutable.  Separately, some =:unknown-struct=
-are not globals but incomplete/forward-declared struct *types* (e.g. a
-=sqlite3*= parameter) — a struct-completeness issue, not a global one.
+** Step C-3 — recursive non-zero aggregate initializer layout [DONE 2026-06-24]
+*cfront only* (no upstream change).  =--lay= recursively byte-encodes a
+non-zero struct / array initializer into a blob (+ relocs for pointer
+cells), handling: integer scalars; =float= (=--float32-bytes=, IEEE-754
+single) and =double= (reuses =--double-to-bits=) via =--const-number=;
+inline =char[N] = "..."= fields; positional =struct= (each field at its
+layout offset, gaps zero); arrays (incl. an implicit =[]= sized from the
+initializer via =--resolve-array-dim=); and arbitrary nesting.
+=--global-image= routes reloc-free read-only aggregates to =.rodata=,
+reloc-bearing / written ones to =.data=.
+
+*Safety*: the parser now tags any aggregate that used a *designated*
+initializer (=.f=/=[i]=) as =init-list-designated= (positions were
+dropped), and =--lay= refuses it — so only positional aggregates are laid
+out; a designated one is skipped rather than positionally miscompiled.
+
+Verified: ERT =nelisp-cfront-global-aggregate-init-e2e= — an
+=aXformType=-style array of =struct { u8; char[7]; double; }= plus a
+positional =struct= global, read back exactly ("6 3 s h 1005 864000 3 7";
+73/73 suite green).  =lower-gap=: coverage 88.0% → 88.3% (2106 → 2111);
+=:addr-of-non-memory-var= 55 → 50 (a =&global= in a function body resolves
+once the aggregate global is registered).
+
+*Still deferred*: =&otherGlobal= *initializers* (reloc to a data symbol —
+same machinery, but the target must be proven to be an emitted global, a
+collect-order/2-pass concern); and a parser that *preserves* designated
+positions (so designated aggregates can be laid out).  The dominant
+residual buckets are now mostly *not* about global initializers:
+=:unknown-struct= (121) is dominated by incomplete / forward-declared
+struct *types* such as a =sqlite3*= parameter member access — a
+struct-type-completeness milestone, orthogonal to globals;
+=:non-constant-array-size= (31) is VLAs / non-constant dims; =:varargs=
+(6).  The global-data milestone (Steps A–C-3 + D) is effectively
+complete: coverage 36% → 75% (M5 sweep) → *88.3%*.
 
 ** Step D — string literals (=:string-literal=, 282)  [DONE 2026-06-24]
 Implemented in cfront (=nelisp-cfront-lower=):

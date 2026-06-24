@@ -199,6 +199,39 @@ int main(void){
     (should (equal "hello alpha beta gamma" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-global-aggregate-init-e2e ()
+  "Step C-3: a non-zero aggregate global is laid out recursively — an array
+of structs with a `double' field and an inline `char[]' field (implicit
+`[]' size), and a positional `struct' global — read back correctly."
+  (unless (nelisp-cfront-global-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-global-test--run "
+typedef unsigned char u8;
+static const struct { u8 nName; char zName[7]; double rLimit; } aXformType[] = {
+  { 6, \"second\", 100.5 },
+  { 4, \"hour\",   3600.0 },
+  { 3, \"day\",    86400.0 },
+};
+struct Pt { int x; int y; } origin = { 3, 7 };
+int getn(int i){ return aXformType[i].nName; }
+int getc0(int i){ return aXformType[i].zName[0]; }
+long lim_x10(int i){ return (long)(aXformType[i].rLimit * 10.0); }
+int ox(void){ return origin.x; }
+int oy(void){ return origin.y; }
+" "
+#include <stdio.h>
+extern int getn(int), getc0(int), ox(void), oy(void);
+extern long lim_x10(int);
+int main(void){
+  printf(\"%d %d %c %c %ld %ld %d %d\\n\",
+         getn(0), getn(2), getc0(0), getc0(1), lim_x10(0), lim_x10(2), ox(), oy());
+  return (getn(0)==6 && getn(2)==3 && getc0(0)=='s' && getc0(1)=='h' &&
+          lim_x10(0)==1005 && lim_x10(2)==864000 && ox()==3 && oy()==7) ? 0 : 1;
+}
+")))
+    (should (equal "6 3 s h 1005 864000 3 7" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-global-test)
 
 ;;; nelisp-cfront-global-test.el ends here

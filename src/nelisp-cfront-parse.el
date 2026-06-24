@@ -407,11 +407,16 @@ arrays), so this is parse-only for now."
   (if (nelisp-cfront-parse--at-punct "{")
       (progn
         (nelisp-cfront-parse--advance)
-        (let ((elts nil))
+        (let ((elts nil) (designated nil))
           (while (not (nelisp-cfront-parse--at-punct "}"))
             ;; optional designators: .field = ...  or  [index] = ...
+            ;; The designator itself is discarded (positions are not tracked),
+            ;; so a designated aggregate is tagged `init-list-designated' and
+            ;; the lowerer refuses to byte-lay it (avoids a positional
+            ;; miscompile); positional aggregates stay `init-list'.
             (while (or (nelisp-cfront-parse--at-punct ".")
                        (nelisp-cfront-parse--at-punct "["))
+              (setq designated t)
               (if (nelisp-cfront-parse--at-punct ".")
                   (progn (nelisp-cfront-parse--advance) (nelisp-cfront-parse--eat-ident))
                 (nelisp-cfront-parse--advance)
@@ -421,7 +426,8 @@ arrays), so this is parse-only for now."
             (push (nelisp-cfront-parse--parse-initializer) elts)
             (when (nelisp-cfront-parse--at-punct ",") (nelisp-cfront-parse--advance)))
           (nelisp-cfront-parse--eat-punct "}")
-          (cons 'init-list (nreverse elts))))
+          (cons (if designated 'init-list-designated 'init-list)
+                (nreverse elts))))
     (nelisp-cfront-parse--parse-assign)))
 
 ;;; --- expressions (precedence climbing) -------------------------------

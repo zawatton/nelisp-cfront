@@ -298,6 +298,155 @@ when it is a local, which is harmless since locals are not globals)."
       (walk ast))
     (delete-dups acc)))
 
+;;; --- recursive aggregate initializer layout (Doc 06 Step C-3) -------
+
+(defun nelisp-cfront-lower--strip-one-array (ty)
+  "Return TY with its FIRST `:array' dimension removed (= the element type
+of one array level), preserving plist order."
+  (let ((out nil) (p ty) (done nil))
+    (while p
+      (if (and (not done) (eq (car p) :array))
+          (setq done t)
+        (setq out (append out (list (car p) (cadr p)))))
+      (setq p (cddr p)))
+    out))
+
+(defun nelisp-cfront-lower--resolve-array-dim (ty init)
+  "If TY's first array dimension is unknown (`t', from a `[]' with an
+initializer) and INIT is an init-list, substitute the element count so the
+type becomes sizeable."
+  (if (and (eq (plist-get ty :array) t)
+           (consp init) (memq (car init) '(init-list init-list-designated)))
+      (let ((out nil) (p ty) (done nil))
+        (while p
+          (if (and (not done) (eq (car p) :array))
+              (progn (setq out (append out (list :array (length (cdr init)))))
+                     (setq done t))
+            (setq out (append out (list (car p) (cadr p)))))
+          (setq p (cddr p)))
+        out)
+    ty))
+
+(defun nelisp-cfront-lower--const-number (e)
+  "Evaluate a constant numeric initializer E to an Elisp number (integer or
+float), supporting literals, casts, unary +/-, and +-*/ arithmetic.
+Signals `nelisp-cfront-lower-error' when E is not a compile-time number."
+  (pcase (car-safe e)
+    ('fnum (nth 1 e))
+    ('int (nth 1 e))
+    ('cast (nelisp-cfront-lower--const-number (nth 2 e)))
+    ('unop (let ((v (nelisp-cfront-lower--const-number (nth 2 e))))
+             (pcase (nth 1 e)
+               ("-" (- v)) ("+" v)
+               ("~" (lognot (truncate v)))
+               (_ (nelisp-cfront-lower--err :non-const-number e)))))
+    ('binop (let ((a (nelisp-cfront-lower--const-number (nth 2 e)))
+                  (b (nelisp-cfront-lower--const-number (nth 3 e))))
+              (pcase (nth 1 e)
+                ("+" (+ a b)) ("-" (- a b)) ("*" (* a b))
+                ("/" (if (and (integerp a) (integerp b))
+                         (if (= b 0) 0 (/ a b))
+                       (/ (float a) b)))
+                (_ (nelisp-cfront-lower--err :non-const-number e)))))
+    (_ (nelisp-cfront-lower--err :non-const-number e))))
+
+(defun nelisp-cfront-lower--float32-bytes (x)
+  "Encode double X as IEEE-754 single-precision (4 little-endian bytes)."
+  (let ((bits
+         (cond
+          ((= x 0.0) (if (< (/ 1.0 x) 0) #x80000000 0))
+          ((/= x x) #x7FC00000)
+          (t (let* ((sign (if (< x 0) 1 0)) (ax (abs x))
+                    (fe (frexp ax)) (m (car fe)) (e (cdr fe))
+                    (biased (+ e 126))
+                    (frac (- (* 2.0 m) 1.0))
+                    (mant (round (* frac (expt 2.0 23)))))
+               (when (= mant (ash 1 23)) (setq mant 0 biased (1+ biased)))
+               (cond ((>= biased 255) (logior (ash sign 31) #x7F800000))
+                     ((<= biased 0) (ash sign 31))
+                     (t (logior (ash sign 31) (ash biased 23) mant))))))))
+    (nelisp-cfront-lower--pack-int bits 4)))
+
+(defun nelisp-cfront-lower--lay (ty init)
+  "Recursively encode initializer INIT for type TY into (BYTES . RELOCS):
+BYTES has length (type-size TY); RELOCS is a list of (ABS-OFFSET
+TARGET-SYM ADDEND) for pointer cells.  Handles scalars (int/float/double),
+pointers (string/&/const), inline `char[]' strings, arrays, and nested
+structs (positional initializers only).  Signals `nelisp-cfront-lower-
+error' on anything not representable so the caller can skip the global."
+  (setq ty (nelisp-cfront-lower--resolve-array-dim ty init))
+  (let* ((size (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))
+         (buf (make-string size 0))
+         (relocs nil))
+    (cl-labels
+        ((place (off bytes)
+           (dotimes (i (length bytes)) (aset buf (+ off i) (aref bytes i))))
+         (lay (off ty init)
+           (let ((ptr (or (plist-get ty :ptr) 0))
+                 (arr (plist-get ty :array))
+                 (base (plist-get ty :base)))
+             (cond
+              ;; designated aggregates: positions were dropped by the parser.
+              ((and (consp init) (eq (car init) 'init-list-designated))
+               (nelisp-cfront-lower--err :designated-init init))
+              ;; array (or inline char[] from a string)
+              (arr
+               (let* ((ety (nelisp-cfront-lower--strip-one-array ty))
+                      (esz (nelisp-cfront-type-size ety nelisp-cfront-lower--structs)))
+                 (cond
+                  ((null init) nil)                ; zero-filled
+                  ((and (eq (car-safe init) 'str)
+                        (= 0 (or (plist-get ety :ptr) 0))
+                        (eq (plist-get ety :base) 'char) (= esz 1))
+                   (place off (encode-coding-string (nth 1 init) 'utf-8 t)))
+                  ((eq (car-safe init) 'init-list)
+                   (let ((i 0))
+                     (dolist (e (cdr init)) (lay (+ off (* i esz)) ety e)
+                             (setq i (1+ i)))))
+                  (t (nelisp-cfront-lower--err :bad-array-init init)))))
+              ;; pointer cell
+              ((> ptr 0)
+               (let ((cell (nelisp-cfront-lower--pointer-init-cell
+                            (or init '(int 0)))))
+                 (unless cell (nelisp-cfront-lower--err :bad-pointer-init init))
+                 (place off (car cell))
+                 (when (cdr cell)
+                   (push (list (+ off (nth 0 (cdr cell)))
+                               (nth 1 (cdr cell)) (nth 2 (cdr cell)))
+                         relocs))))
+              ;; nested struct/union
+              ((eq base 'struct)
+               (cond
+                ((null init) nil)
+                ((eq (car-safe init) 'init-list)
+                 (let ((fs (plist-get (nelisp-cfront-type--resolve-struct
+                                       ty nelisp-cfront-lower--structs) :fields)))
+                   (dolist (e (cdr init))
+                     (unless fs (nelisp-cfront-lower--err :too-many-init e))
+                     (let ((fp (cdr (car fs))))
+                       (when (plist-get fp :bits)
+                         (nelisp-cfront-lower--err :bitfield-init fp))
+                       (lay (+ off (plist-get fp :offset)) (plist-get fp :type) e))
+                     (setq fs (cdr fs)))))
+                (t (nelisp-cfront-lower--err :bad-struct-init init))))
+              ;; float / double scalar
+              ((memq base '(float double))
+               (let ((v (float (if (null init) 0
+                                 (nelisp-cfront-lower--const-number init)))))
+                 (place off (if (eq base 'float)
+                                (nelisp-cfront-lower--float32-bytes v)
+                              (nelisp-cfront-lower--pack-int
+                               (nelisp-cfront-float--double-to-bits v) 8)))))
+              ;; integer scalar
+              ((memq base '(char short int long))
+               (place off (nelisp-cfront-lower--pack-int
+                           (if (null init) 0
+                             (truncate (nelisp-cfront-lower--const-number init)))
+                           (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
+              (t (nelisp-cfront-lower--err :bad-scalar-init ty))))))
+      (lay 0 ty init))
+    (cons buf (nreverse relocs))))
+
 (defun nelisp-cfront-lower--pointer-init-cell (expr)
   "Lower one pointer-typed initializer EXPR to (BYTES . RELOC): BYTES is 8
 bytes and RELOC is (BYTE-OFFSET TARGET-SYM ADDEND) or nil.  Handles a
@@ -377,7 +526,21 @@ into the blob.  WRITTEN-P forces a writable section."
       (let ((sz (ignore-errors
                   (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
         (and (integerp sz) (> sz 0) (list 'bss (make-string sz 0) nil))))
-     ;; non-zero struct/array aggregate initializer -> not handled yet.
+     ;; Step C-3: a non-zero struct / array aggregate initializer is laid out
+     ;; recursively into bytes (+ relocs for any pointer cells).  Reloc-free
+     ;; read-only data stays in `.rodata'; reloc-bearing or written data goes
+     ;; to `.data'.  Designated / non-constant inits make `--lay' signal, so
+     ;; the global is skipped.
+     ((and (consp init) (memq (car init) '(init-list init-list-designated)))
+      (let ((img (condition-case nil
+                     (nelisp-cfront-lower--lay ty init)
+                   (error nil))))
+        (and img
+             (let ((relocs (cdr img)))
+               (list (if (or relocs written-p) 'data 'rodata)
+                     (car img)
+                     (mapcar (lambda (r) (list (nth 0 r) (nth 1 r) (nth 2 r)))
+                             relocs))))))
      (t nil))))
 
 (defun nelisp-cfront-lower--collect-globals (ast)
