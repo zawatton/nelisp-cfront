@@ -645,3 +645,23 @@ mis-typing is fixed for every shadowing function, not just the failing
 ones.  Remaining tail: `:non-constant-array-size' 12 (VLAs),
 `:unknown-struct' 9 (anonymous tag-nil structs + a function-local
 `Sublist' layout), `:addr-of' 8, `:deref-non-pointer' 7, `:varargs' 7.
+
+* §18 :non-constant-array-size — resolve implicit `[]' for sizeof (98.2% → 98.5%)
+
+The bucket split: 8 were `sizeof(globalArray)' (the count idiom
+`sizeof(G)/sizeof(G[0])') where the global's *registered* type still
+carried the unresolved `:array t' — so `type-of(G)' / `sizeof(G)'
+signalled, even though `--global-image' had resolved the dim internally
+for the blob bytes.  Fixes:
+- `--collect-globals' now stores the *resolved* type (`--resolve-array-dim
+  ty init') in the registry, and `--resolve-array-dim' also resolves a
+  string-initialized `char[]' (length + NUL).  So `type-of(G)' sees a
+  sized array.
+- (`--sizeof' already routes through `type-size'.)
+
+Result: `:non-constant-array-size' 12 → 5, coverage 98.2% → *98.5%*
+(2355 / 2392).  The remaining 5 are `sizeof(EXPR)' *array dimensions*
+(e.g. `char z[sizeof(aJournalMagic)]' / `[sizeof(pPager->dbFileVers)]') and
+one `__builtin_offsetof' dim — these need a tenv-aware dimension evaluator
+at lower time (the dim's expr type is only known with the function's local
+type env), deferred.

@@ -232,6 +232,30 @@ int main(void){
     (should (equal "6 3 s h 1005 864000 3 7" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-global-sizeof-implicit-dim-e2e ()
+  "A global array with an implicit `[]' dimension is registered with its
+resolved size, so the `sizeof(arr)/sizeof(arr[0])' count idiom works — for
+both an init-list array and a string-initialized char array."
+  (unless (nelisp-cfront-global-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-global-test--run "
+static const unsigned char tbl[] = { 1, 2, 3, 4, 5 };
+static const char magic[] = \"abcdef\";
+int ntbl(void){ return (int)(sizeof(tbl)/sizeof(tbl[0])); }
+int magicsz(void){ return (int)sizeof(magic); }
+int sumtbl(void){ int s=0; int i;
+  for(i=0;i<(int)(sizeof(tbl)/sizeof(tbl[0]));i++) s+=tbl[i]; return s; }
+" "
+#include <stdio.h>
+extern int ntbl(void), magicsz(void), sumtbl(void);
+int main(void){
+  printf(\"%d %d %d\\n\", ntbl(), magicsz(), sumtbl());
+  return (ntbl()==5 && magicsz()==7 && sumtbl()==15) ? 0 : 1;
+}
+")))
+    (should (equal "5 7 15" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-global-test)
 
 ;;; nelisp-cfront-global-test.el ends here

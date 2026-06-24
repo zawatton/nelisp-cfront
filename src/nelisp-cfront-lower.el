@@ -326,19 +326,24 @@ of one array level), preserving plist order."
 
 (defun nelisp-cfront-lower--resolve-array-dim (ty init)
   "If TY's first array dimension is unknown (`t', from a `[]' with an
-initializer) and INIT is an init-list, substitute the element count so the
-type becomes sizeable."
-  (if (and (eq (plist-get ty :array) t)
-           (consp init) (memq (car init) '(init-list init-list-designated)))
-      (let ((out nil) (p ty) (done nil))
-        (while p
-          (if (and (not done) (eq (car p) :array))
-              (progn (setq out (append out (list :array (length (cdr init)))))
-                     (setq done t))
-            (setq out (append out (list (car p) (cadr p)))))
-          (setq p (cddr p)))
-        out)
-    ty))
+initializer) substitute the count so the type becomes sizeable: an
+init-list contributes its element count, a string literal its byte length
+plus the NUL terminator (so `sizeof(zMagic)' is exact)."
+  (let ((count (cond
+                ((and (consp init) (memq (car init) '(init-list init-list-designated)))
+                 (length (cdr init)))
+                ((and (consp init) (eq (car init) 'str))
+                 (1+ (length (encode-coding-string (nth 1 init) 'utf-8 t)))))))
+    (if (and (eq (plist-get ty :array) t) count)
+        (let ((out nil) (p ty) (done nil))
+          (while p
+            (if (and (not done) (eq (car p) :array))
+                (progn (setq out (append out (list :array count)))
+                       (setq done t))
+              (setq out (append out (list (car p) (cadr p)))))
+            (setq p (cddr p)))
+          out)
+      ty)))
 
 (defun nelisp-cfront-lower--const-number (e)
   "Evaluate a constant numeric initializer E to an Elisp number (integer or
@@ -584,8 +589,13 @@ Globals with a non-zero struct/array aggregate initializer are skipped."
             (let ((img (nelisp-cfront-lower--global-image
                         ty init (and (member name written) t))))
               (when img
-                (push (cons name (list :type ty :section (nth 0 img)
-                                       :bytes (nth 1 img) :relocs (nth 2 img)))
+                ;; Store the *resolved* type (implicit `[]' replaced by the
+                ;; initializer count) so `type-of'/`sizeof(G)' on the global
+                ;; see a sized array (the `sizeof(G)/sizeof(G[0])' idiom).
+                (push (cons name
+                            (list :type (nelisp-cfront-lower--resolve-array-dim ty init)
+                                  :section (nth 0 img)
+                                  :bytes (nth 1 img) :relocs (nth 2 img)))
                       out)))))))
     (nreverse out)))
 
