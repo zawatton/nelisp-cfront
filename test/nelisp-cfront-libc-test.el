@@ -301,6 +301,40 @@ int main(void){
     (should (equal "150|28|3|1000000000009|6|OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-odd-arity-stack-arg-extern-align-e2e ()
+  "Guard for the SysV odd-arity stack-alignment fix (nelisp AOT): an
+ODD-arity caller (3 params) calls the SSE-heavy variadic `snprintf' with
+10 total GP args, so 4 land on the stack and the computed `base+k' args
+take the extern-call general-stack-spill path.  Before the fix, the
+`needs-align' / `spill-needs-align' formulas added the enclosing defun
+arity on top of a prologue that already aligned rsp to 0 mod 16, so the
+call landed at rsp = 8 mod 16 and `snprintf' SIGSEGV'd on aligned SSE.
+The output must match glibc."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+extern int snprintf(char *, unsigned long, const char *, ...);
+int many(char *b, unsigned long n, int base){
+  return snprintf(b, n, \"%d %d %d %d %d %d %d\",
+                  base+1, base+2, base+3, base+4, base+5, base+6, base+7);
+}
+")
+         (drv "
+#include <stdio.h>
+#include <string.h>
+extern int many(char *, unsigned long, int);
+int main(void){
+  char b[64];
+  int r = many(b, sizeof b, 10);
+  int ok = (strcmp(b,\"11 12 13 14 15 16 17\")==0) && (r==20);
+  printf(\"%s|%d|%s\\n\", b, r, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "11 12 13 14 15 16 17|20|OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here
