@@ -247,20 +247,99 @@ arrays zero-pad to their declared dimension."
        (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)))
      (t nil))))
 
+(defun nelisp-cfront-lower--bytes-all-zero-p (s)
+  "Non-nil when unibyte string S is empty or all NUL bytes."
+  (cl-every (lambda (b) (= b 0)) s))
+
+(defun nelisp-cfront-lower--init-all-zero-p (init)
+  "Non-nil when global initializer INIT is absent or evaluates to all
+zeros (a zero scalar, `{0,}'-style aggregate, or empty string) — i.e. the
+global can be reserved as zero-filled `.bss' without computing exact
+field/element bytes."
+  (cond
+   ((null init) t)
+   ((and (consp init) (eq (car init) 'init-list))
+    (cl-every #'nelisp-cfront-lower--init-all-zero-p (cdr init)))
+   ((and (consp init) (eq (car init) 'str)) (string= (nth 1 init) ""))
+   (t (condition-case nil (= 0 (nelisp-cfront-parse--const-eval init)) (error nil)))))
+
+(defun nelisp-cfront-lower--lvalue-root (e)
+  "Return the base variable NAME of lvalue expression E, peeling
+index/member/arrow/unary forms; nil when there is no var root."
+  (pcase (car-safe e)
+    ('var (nth 1 e))
+    ('index (nelisp-cfront-lower--lvalue-root (nth 1 e)))
+    ((or 'member 'arrow) (nelisp-cfront-lower--lvalue-root (nth 1 e)))
+    ('unop (nelisp-cfront-lower--lvalue-root (nth 2 e)))
+    (_ nil)))
+
+(defun nelisp-cfront-lower--collect-written-globals (ast)
+  "Return the list of variable NAMEs that may be mutated anywhere in AST —
+appearing as the root of an assignment / increment lvalue or as the
+operand of `&'.  Such globals need a writable section (`.data'/`.bss')
+rather than read-only `.rodata' (conservative: a name is also collected
+when it is a local, which is harmless since locals are not globals)."
+  (let ((acc nil))
+    (cl-labels
+        ((walk (node)
+           (when (consp node)
+             (pcase (car node)
+               ('assign
+                (let ((r (nelisp-cfront-lower--lvalue-root (nth 2 node))))
+                  (when r (push r acc))))
+               ((or 'pre 'post)
+                (let ((r (nelisp-cfront-lower--lvalue-root (nth 2 node))))
+                  (when r (push r acc))))
+               ('unop
+                (when (equal (nth 1 node) "&")
+                  (let ((r (nelisp-cfront-lower--lvalue-root (nth 2 node))))
+                    (when r (push r acc))))))
+             (dolist (c node) (walk c)))))
+      (walk ast))
+    (delete-dups acc)))
+
+(defun nelisp-cfront-lower--global-image (ty init written-p)
+  "Return (SECTION . BYTES) for a global of type TY with initializer INIT,
+or nil when this step cannot lay it out.  SECTION is `rodata' (read-only
+const integer), `data' (writable, initialized), or `bss' (writable,
+zero-filled — BYTES is a zero placeholder whose length is the reserved
+size).  WRITTEN-P forces a writable section."
+  (let ((const-bytes (ignore-errors
+                       (nelisp-cfront-lower--global-bytes ty init))))
+    (cond
+     ;; const integer scalar / flat array with a computable image.
+     (const-bytes
+      (cond
+       ((not written-p) (cons 'rodata const-bytes))
+       ((nelisp-cfront-lower--bytes-all-zero-p const-bytes) (cons 'bss const-bytes))
+       (t (cons 'data const-bytes))))
+     ;; absent / all-zero initializer of any sized type (struct, pointer,
+     ;; scalar, array) -> reserve zero-filled .bss.
+     ((nelisp-cfront-lower--init-all-zero-p init)
+      (let ((sz (ignore-errors
+                  (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
+        (and (integerp sz) (> sz 0) (cons 'bss (make-string sz 0)))))
+     ;; non-zero, non-const-integer initializer (struct/array aggregate,
+     ;; pointer arrays, string-into-pointer) -> not handled yet.
+     (t nil))))
+
 (defun nelisp-cfront-lower--collect-globals (ast)
-  "Return an alist NAME->(:type TY :bytes UNIBYTE) for every const integer
-global scalar/array in AST `(program TOP...)'.  Non-constant or
-non-integer globals are skipped (left for Step C)."
-  (let ((out nil))
+  "Return an alist NAME->(:type TY :section SECT :bytes UNIBYTE) for the
+program's globals this step can place: read-only const integers (rodata),
+writable const integers (data/bss), and zero/uninitialized scalars,
+pointers, structs, and arrays (bss).  Globals with a non-zero
+struct/pointer-array initializer are skipped (future work)."
+  (let ((written (nelisp-cfront-lower--collect-written-globals ast))
+        (out nil))
     (dolist (top (cdr ast))
       (when (eq (car top) 'global)
         (let ((ty (nth 1 top)) (name (nth 2 top)) (init (nth 3 top)))
-          (when init
-            (condition-case nil
-                (let ((bytes (nelisp-cfront-lower--global-bytes ty init)))
-                  (when (and bytes (not (assoc name out)))
-                    (push (cons name (list :type ty :bytes bytes)) out)))
-              (error nil))))))           ; non-foldable -> skip this global
+          (unless (assoc name out)
+            (let ((img (nelisp-cfront-lower--global-image
+                        ty init (and (member name written) t))))
+              (when img
+                (push (cons name (list :type ty :section (car img) :bytes (cdr img)))
+                      out)))))))
     (nreverse out)))
 
 ;;; --- C string literal pool (Doc 06 Step D) --------------------------
@@ -668,9 +747,12 @@ matches C, so the raw value is used directly."
                 (nelisp-cfront-lower--expr-float-p rhs)
                 lhs-float)))
     (cond
-     ;; plain value-slot scalar (NOT an address-taken / memory-backed var)
+     ;; plain value-slot scalar (NOT an address-taken / memory-backed var,
+     ;; and NOT a global — a global lowers to a `data-addr' store below, not
+     ;; a `setq' on a free symbol, which would mean a NeLisp special var).
      ((and (eq (car lhs) 'var)
-           (not (nelisp-cfront-lower--mem-var-scalar-p (nth 1 lhs))))
+           (not (nelisp-cfront-lower--mem-var-scalar-p (nth 1 lhs)))
+           (not (nelisp-cfront-lower--global-var-p (nth 1 lhs))))
        (let ((name (nelisp-cfront-lower--lvar (nth 1 lhs))))
          (if (string= op "=")
              `(setq ,name ,grhs)
@@ -1260,7 +1342,8 @@ skipped in the MVP (functions only)."
            ;; then the zero helper, float helpers, and the lowered functions.
            (mapcar (lambda (g)
                      `(data-blob ,(intern (car g))
-                                 ,(plist-get (cdr g) :bytes) rodata))
+                                 ,(plist-get (cdr g) :bytes)
+                                 ,(plist-get (cdr g) :section)))
                    nelisp-cfront-lower--globals)
            (mapcar (lambda (e)
                      `(data-blob ,(cdr e)

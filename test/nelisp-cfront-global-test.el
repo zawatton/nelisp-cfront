@@ -26,18 +26,18 @@
 ;;; --- unit: collection + byte packing + lowering shape ---------------
 
 (ert-deftest nelisp-cfront-global-collect-bytes ()
-  "Const integer globals collect with correct little-endian rodata bytes
-and array dimensions are retained on the type."
+  "Read-only const integer globals collect into `.rodata' with correct
+little-endian bytes; array dimensions are retained on the type."
   (let* ((ast (nelisp-cfront-parse "
 const unsigned char tbl[4] = {10, 20, 250, 99};
 const int words[3] = {1, -1, 256};
 const int answer = 42;
-struct P { int x; } gp;            /* non-const struct global: skipped */
 "))
          (nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
          (g (nelisp-cfront-lower--collect-globals ast)))
-    ;; struct global `gp' is not a const integer -> not collected.
     (should (equal '("tbl" "words" "answer") (mapcar #'car g)))
+    ;; never written + const integer -> read-only .rodata.
+    (should (eq 'rodata (plist-get (cdr (assoc "tbl" g)) :section)))
     ;; array dimension retained on the type.
     (should (equal 4 (plist-get (plist-get (cdr (assoc "tbl" g)) :type) :array)))
     (should (equal (unibyte-string 10 20 250 99)
@@ -47,6 +47,28 @@ struct P { int x; } gp;            /* non-const struct global: skipped */
                    (plist-get (cdr (assoc "words" g)) :bytes)))
     (should (equal (unibyte-string 42 0 0 0)
                    (plist-get (cdr (assoc "answer" g)) :bytes)))))
+
+(ert-deftest nelisp-cfront-global-section-selection ()
+  "Section choice (Doc 06 Step C): read-only const int -> rodata; a written
+scalar -> data; a zero/uninitialized struct/pointer -> bss."
+  (let* ((ast (nelisp-cfront-parse "
+const int ro = 7;
+int counter = 5;
+char *cursor;
+struct P { int a; int b; } gp;
+int bump(void){ counter += 1; return counter; }
+char *getcur(void){ return cursor; }
+int geta(void){ return gp.a; }
+int getro(void){ return ro; }
+"))
+         (nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
+         (g (nelisp-cfront-lower--collect-globals ast)))
+    (should (eq 'rodata (plist-get (cdr (assoc "ro" g)) :section)))
+    (should (eq 'data   (plist-get (cdr (assoc "counter" g)) :section)))
+    (should (eq 'bss    (plist-get (cdr (assoc "cursor" g)) :section)))
+    (should (eq 'bss    (plist-get (cdr (assoc "gp" g)) :section)))
+    ;; struct global sized from its layout (2 ints = 8 bytes of bss).
+    (should (= 8 (length (plist-get (cdr (assoc "gp" g)) :bytes))))))
 
 (ert-deftest nelisp-cfront-global-lowers-via-data-addr ()
   "A global array index lowers to a `data-addr'-based load and the program
@@ -113,6 +135,43 @@ int main(void){
 }
 ")))
     (should (equal "10 250 200 -1 -128 25 42 55" (cdr res)))
+    (should (= 0 (car res)))))
+
+(ert-deftest nelisp-cfront-global-writable-data-bss-e2e ()
+  "Step C: a mutable scalar (.data), a zero-initialized struct and a
+pointer global (.bss) all read/write correctly; a const stays read-only."
+  (unless (nelisp-cfront-global-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-global-test--run "
+struct Stat { long now[4]; long mx[4]; } sStat = { {0,}, {0,} };
+int counter = 5;
+char *cursor;
+const int ro = 7;
+void up(int i, long v){ sStat.now[i] += v; if (sStat.now[i] > sStat.mx[i]) sStat.mx[i] = sStat.now[i]; }
+long getnow(int i){ return sStat.now[i]; }
+long getmx(int i){ return sStat.mx[i]; }
+int bump(void){ counter += 1; return counter; }
+void setcur(char *p){ cursor = p; }
+long curval(void){ return cursor ? *cursor : -1; }
+int getro(void){ return ro; }
+" "
+#include <stdio.h>
+extern void up(int,long); extern long getnow(int), getmx(int);
+extern int bump(void), getro(void);
+extern void setcur(char*); extern long curval(void);
+int main(void){
+  up(0,10); up(0,5); up(1,3);
+  int b1 = bump();
+  int b2 = bump();
+  char c = 'Z'; setcur(&c);
+  long cv = curval();
+  printf(\"%ld %ld %ld %d %d %ld %d\\n\",
+         getnow(0), getmx(0), getnow(1), b1, b2, cv, getro());
+  return (getnow(0)==15 && getmx(0)==15 && getnow(1)==3 &&
+          b1==6 && b2==7 && cv=='Z' && getro()==7) ? 0 : 1;
+}
+")))
+    (should (equal "15 15 3 6 7 90 7" (cdr res)))
     (should (= 0 (car res)))))
 
 (provide 'nelisp-cfront-global-test)

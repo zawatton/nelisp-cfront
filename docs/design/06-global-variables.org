@@ -114,10 +114,44 @@ real =sqlite3.pp.c=: =:deref-non-pointer= 110 → 68, overall coverage 75.2%
 → 76.5% (1798 → 1829 / 2392).  Remaining global =:deref= cases need Step C
 (struct-member-of-global, pointer globals, non-const array dims).
 
-** Step C — general globals (.data read/write, struct/scalar globals)
-- =:unknown-struct= globals (=sqlite3Stat.nowValue[op]=): emit the global
-  struct into =.data=/=.bss=; member/index via =data-addr-local= + offset.
-- Mutable globals: same address op, normal load/store.
+** Step C — general globals (.data read/write, struct/scalar globals)  [DONE-1 2026-06-24]
+*Upstream keystone* (=nelisp-aot-compiler= + reuse of =nelisp-elf-write='s
+existing =.data=/=.bss= support): =data-blob='s SECTION arg is now honoured
+end-to-end.  =compile-to-link-unit= partitions blobs into =rodata= /
+=data= (PROGBITS, writable) / =bss= (NOBITS, writable, length-only); the
+unit plist carries =:data= / =:bss-size=, which =compile-to-object= passes
+to the ELF writer.  Verified raw (ERT =data-blob-data-and-bss-*=): a
+=.data= and a =.bss= blob both read *and write* via =data-addr= through a C
+driver.
+
+*cfront* (=nelisp-cfront-lower=): the global registry now places, in
+addition to Step B's read-only const integers (=rodata=):
+- writable scalars (=int counter = 5;= mutated anywhere) → =data=;
+- zero- or un-initialized scalars, *pointers*, *structs*, and arrays of
+  any sized type → =bss= (=--global-image= + =--init-all-zero-p=).
+Section choice is driven by =--collect-written-globals= (a name assigned /
+incremented / address-taken needs a writable section).  =--collect-globals=
+returns =(:type :section :bytes)=; =lower-program= emits each with its
+section.  A global scalar assignment lowers to a =data-addr= store (was a
+=setq= on a free symbol = a NeLisp special-var write — the bug fixed here).
+Member / index / =&G= on a global all resolve through =data-addr=.
+
+Verified: ERT =nelisp-cfront-global-section-selection= +
+=-writable-data-bss-e2e= (struct global read/write, mutable scalar across
+calls, pointer global, const stays read-only; 71/71 suite green).
+=lower-gap=: =:unknown-struct= 148 → 121, coverage 86.7% → 87.8% (2073 →
+2100 / 2392).
+
+*Deferred to a follow-on (Step C-2 / "data relocations")*: globals with a
+*non-zero aggregate* initializer (positional/designated struct inits,
+arrays of structs) and globals whose initializer embeds a *pointer*
+(=zName= string-literal fields in =aXformType[]=, =&otherGlobal=).  The
+latter needs per-blob relocations inside =.data= (a string/global address
+baked into the blob), a capability =data-blob= does not yet have.  These
+dominate the residual =:unknown-struct= / =:addr-of-non-memory-var= /
+=:deref-non-pointer= buckets.  Separately, some =:unknown-struct= are not
+globals at all but incomplete/forward-declared struct *types* (e.g. a
+=sqlite3*= parameter) — a struct-completeness issue, not a global one.
 
 ** Step D — string literals (=:string-literal=, 282)  [DONE 2026-06-24]
 Implemented in cfront (=nelisp-cfront-lower=):
