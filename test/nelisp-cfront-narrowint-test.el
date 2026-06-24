@@ -78,6 +78,41 @@ int main(void){
     (should (equal "-3 -300 -100000 200 -888" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-unsigned-shift-and-compare-e2e ()
+  "Unsigned 64-bit operators behave as unsigned even when bit 63 is set:
+`>>' is logical (zero-fill, not sign-extending `sar'), and the relational
+operators order operands as unsigned.  This is the codegen the real SQLite
+varint codec relies on (`v>>=7' / `v<=0x7f' on a `u64')."
+  (unless (nelisp-cfront-narrowint-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-narrowint-test--run "
+typedef unsigned long u64;
+u64 ushr(u64 v){ return v >> 7; }                 /* logical shift */
+u64 ushr_assign(u64 v){ v >>= 60; return v; }     /* compound, logical */
+int ule(u64 v){ return v <= 0x7f; }               /* unsigned compare */
+int ult(u64 a, u64 b){ return a < b; }
+int sshr_ok(long v){ return (v >> 4) == -8; }     /* signed >> stays arithmetic */
+" "
+#include <stdio.h>
+typedef unsigned long u64;
+extern u64 ushr(u64); extern u64 ushr_assign(u64);
+extern int ule(u64); extern int ult(u64,u64); extern int sshr_ok(long);
+int main(void){
+  u64 big = 0xfedcba9876543210UL;
+  int ok = (ushr(big)==(big>>7))
+        && (ushr_assign(0x8000000000000000UL)==8)
+        && (ule(0x8000000000000000UL)==0) && (ule(0x7f)==1)
+        && (ult(0x8000000000000000UL,1)==0) && (ult(1,2)==1)
+        && (sshr_ok(-128)==1);
+  printf(\"ushr=0x%lx ule_hi=%d ult_hi=%d %s\\n\",
+         ushr(big), ule(0x8000000000000000UL), ult(0x8000000000000000UL,1),
+         ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")))
+    (should (equal "ushr=0x1fdb97530eca864 ule_hi=0 ult_hi=0 OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-narrowint-test)
 
 ;;; nelisp-cfront-narrowint-test.el ends here

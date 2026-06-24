@@ -113,7 +113,14 @@ module-global symbol; a reference lowers via `(data-addr SYM)'.")
   '(("+" . +) ("-" . -) ("*" . *) ("/" . /) ("%" . mod)
     ("&" . logand) ("|" . logior) ("^" . logxor) ("<<" . shl) (">>" . sar)
     ("<" . <) ("<=" . <=) (">" . >) (">=" . >=) ("==" . =))
-  "C binary operators that map directly to a grammar op.")
+  "C binary operators that map directly to a grammar op.
+NOTE: `>>' maps to arithmetic shift (`sar') and the relational ops to
+SIGNED grammar compares; `--binop' overrides both for unsigned operands
+(`shr' / sign-biased compare) — see `nelisp-cfront-lower--int-unsigned-p'.")
+
+(defconst nelisp-cfront-lower--int-min (ash 1 63)
+  "The i64 sign bit (2^63).  XORing both operands by this turns a signed
+grammar compare into an unsigned one: a <u b  <=>  (a^MIN) <s (b^MIN).")
 
 (defun nelisp-cfront-lower--err (what node)
   (signal 'nelisp-cfront-lower-error (list what node)))
@@ -1086,6 +1093,17 @@ so positions stay aligned to call arguments."
         (let ((es (nelisp-cfront-lower--elem-size l)))
           (list (cdr (assoc op nelisp-cfront-lower--binop-map))
                 gl (if (= es 1) gr `(* ,gr ,es)))))
+       ;; unsigned `>>': logical (zero-fill) shift, keyed on the left operand
+       ;; (`sar' would sign-extend a value whose bit 63 is a data bit).
+       ((and (string= op ">>") (nelisp-cfront-lower--int-unsigned-p l))
+        (list 'shr gl gr))
+       ;; unsigned relational compare: bias both operands by 2^63 so the
+       ;; signed grammar op orders them as unsigned (a <u b <=> a^MIN <s b^MIN).
+       ((and (member op '("<" "<=" ">" ">="))
+             (or (nelisp-cfront-lower--int-unsigned-p l)
+                 (nelisp-cfront-lower--int-unsigned-p r)))
+        (list g `(logxor ,gl ,nelisp-cfront-lower--int-min)
+                `(logxor ,gr ,nelisp-cfront-lower--int-min)))
        (g (list g gl gr))
        ((string= op "!=") `(if (= ,gl ,gr) 0 1))
        ((string= op "&&") `(if ,(nelisp-cfront-lower--truth gl)
@@ -1093,6 +1111,26 @@ so positions stay aligned to call arguments."
        ((string= op "||") `(if ,(nelisp-cfront-lower--truth gl) 1
                              ,(nelisp-cfront-lower--truth gr)))
        (t (nelisp-cfront-lower--err :unsupported-binop op))))))
+
+(defun nelisp-cfront-lower--int-unsigned-p (e)
+  "Non-nil when E has an unsigned integer type (not a pointer or array).
+Drives the unsigned `>>' (logical shift) and unsigned relational compares
+in `--binop'; degrades to nil (signed behaviour) when the type is unknown."
+  (let ((ty (ignore-errors (nelisp-cfront-lower--type-of e))))
+    (and ty
+         (= 0 (or (plist-get ty :ptr) 0))
+         (null (plist-get ty :array))
+         (plist-get ty :unsigned)
+         t)))
+
+(defun nelisp-cfront-lower--int-binop-op (bop l)
+  "Grammar op symbol for integer binary operator BOP whose left operand is
+the AST node L.  Honours unsigned `>>' (logical `shr', not arithmetic
+`sar'); other ops come straight from `--binop-map'.  Used by the compound-
+assignment paths (`v >>= k') so they match `--binop's signedness."
+  (if (and (string= bop ">>") (nelisp-cfront-lower--int-unsigned-p l))
+      'shr
+    (cdr (assoc bop nelisp-cfront-lower--binop-map))))
 
 (defun nelisp-cfront-lower--truth (g)
   "Normalise grammar value G to 0/1 (C truthiness, non-zero -> 1)."
@@ -1167,7 +1205,7 @@ matches C, so the raw value is used directly."
                    (unless h (nelisp-cfront-lower--err :unsupported-compound-assign op))
                    (nelisp-cfront-lower--mark-float)
                    `(setq ,name (,h ,name ,(nelisp-cfront-lower--as-double-bits rhs))))
-               (let ((g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+               (let ((g (nelisp-cfront-lower--int-binop-op bop lhs)))
                  (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
                  `(setq ,name (,g ,name ,(nelisp-cfront-lower--expr rhs)))))))))
       ;; memory lvalue: *p / a[i] / p->f / s.f / address-taken scalar var
@@ -1188,7 +1226,7 @@ matches C, so the raw value is used directly."
                        (nelisp-cfront-lower--store-w
                         addr width (list h (nelisp-cfront-lower--load-w addr width)
                                          (nelisp-cfront-lower--as-double-bits rhs))))
-                   (let ((g (cdr (assoc bop nelisp-cfront-lower--binop-map))))
+                   (let ((g (nelisp-cfront-lower--int-binop-op bop lhs)))
                      (unless g (nelisp-cfront-lower--err :unsupported-compound-assign op))
                      (nelisp-cfront-lower--store-w
                       addr width (list g (nelisp-cfront-lower--load-w addr width)
