@@ -135,6 +135,45 @@ int main(void){
     (should (equal "tag=5 OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-builtin-bswap-e2e ()
+  "`__builtin_bswap16/32/64' lower to inline byte-reversal (no external
+symbol), so real code that uses them links and runs.  Includes the verbatim
+real-SQLite big-endian 4-byte serializers `sqlite3Get4byte'/`sqlite3Put4byte'
+(bswap32 + memcpy)."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef unsigned char u8;
+typedef unsigned int u32;
+typedef unsigned long u64;
+extern void *memcpy(void *, const void *, u64);
+u64 b16(u64 x){ return __builtin_bswap16((unsigned short)x); }
+u64 b32(u64 x){ return __builtin_bswap32((u32)x); }
+u64 b64(u64 x){ return __builtin_bswap64(x); }
+u32 sqlite3Get4byte(const u8 *p){ u32 x; memcpy(&x,p,4); return __builtin_bswap32(x); }
+void sqlite3Put4byte(unsigned char *p, u32 v){ u32 x = __builtin_bswap32(v); memcpy(p,&x,4); }
+")
+         (drv "
+#include <stdio.h>
+typedef unsigned char u8;
+typedef unsigned int u32;
+extern unsigned long b16(unsigned long), b32(unsigned long), b64(unsigned long);
+extern u32 sqlite3Get4byte(const u8 *); extern void sqlite3Put4byte(unsigned char *, u32);
+int main(void){
+  unsigned char buf[4]; sqlite3Put4byte(buf, 0x12345678u);
+  int ok = (b16(0xABCD)==0xCDAB) && (b32(0x11223344)==0x44332211)
+        && (b64(0x0102030405060708UL)==0x0807060504030201UL)
+        && buf[0]==0x12 && buf[1]==0x34 && buf[2]==0x56 && buf[3]==0x78
+        && (sqlite3Get4byte(buf)==0x12345678u);
+  printf(\"%lx %lx %lx %x %s\\n\", b16(0xABCD), b32(0x11223344),
+         b64(0x0102030405060708UL), sqlite3Get4byte(buf), ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "cdab 44332211 807060504030201 12345678 OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here

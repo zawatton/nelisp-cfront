@@ -1260,8 +1260,60 @@ matches C, so the raw value is used directly."
                           (nelisp-cfront-float-type-p pt))
                        g))))
 
+(defun nelisp-cfront-lower--bswap32-g (g)
+  "Grammar: byte-reverse the low 32 bits of grammar value G (a let temp).
+Logical `shr' keeps the high bytes zero-filled; result masked to 32 bits."
+  `(logand
+    (logior (logior (shl (logand ,g #xff) 24)
+                    (shl (logand ,g #xff00) 8))
+            (logior (shr (logand ,g #xff0000) 8)
+                    (shr (logand ,g #xff000000) 24)))
+    #xffffffff))
+
+(defun nelisp-cfront-lower--builtin-bswap (name arg)
+  "Lower `__builtin_bswap16/32/64(ARG)' inline (byte reversal), so it needs
+no external symbol — gcc expands these intrinsics inline, they are not real
+libc functions.  ARG is evaluated once into a fresh temp; logical `shr'
+keeps the high bytes zero-filled.  bswap64 composes two bswap32 halves
+(swapping them) — a shallower expression than one eight-term `logior', which
+sidesteps a back-end register-pressure bug on deeply nested shifts.  Returns
+the grammar, or nil if NAME is not a bswap builtin."
+  (let ((w (cond ((string= name "__builtin_bswap16") 16)
+                 ((string= name "__builtin_bswap32") 32)
+                 ((string= name "__builtin_bswap64") 64))))
+    (when w
+      (let ((g (nelisp-cfront-lower--gensym "bsw"))
+            (a (nelisp-cfront-lower--expr arg)))
+        (pcase w
+          (16 `(let ((,g ,a))
+                 (logand (logior (shl (logand ,g #xff) 8)
+                                 (shr (logand ,g #xff00) 8))
+                         #xffff)))
+          (32 `(let ((,g ,a))
+                 ,(nelisp-cfront-lower--bswap32-g g)))
+          ;; bswap64(x) = bswap32(low32(x)) << 32 | bswap32(high32(x)).
+          ;; Each 32-bit half is bound to its OWN temp first so `bswap32-g'
+          ;; operates on a plain symbol (as in the bswap32 case), not a
+          ;; re-substituted compound expression.
+          (64 (let ((glo (nelisp-cfront-lower--gensym "blo32"))
+                    (ghi (nelisp-cfront-lower--gensym "bhi32"))
+                    (lo (nelisp-cfront-lower--gensym "blo"))
+                    (hi (nelisp-cfront-lower--gensym "bhi")))
+                `(let ((,g ,a))
+                   (let ((,glo (logand ,g #xffffffff))
+                         (,ghi (shr ,g 32)))
+                     (let ((,lo ,(nelisp-cfront-lower--bswap32-g glo))
+                           (,hi ,(nelisp-cfront-lower--bswap32-g ghi)))
+                       (logior (shl ,lo 32) ,hi)))))))))))
+
 (defun nelisp-cfront-lower--call (fn args)
   (cond
+   ;; GCC bswap intrinsics: expand inline (no external symbol needed).
+   ((and (eq (car fn) 'var)
+         (member (nth 1 fn) '("__builtin_bswap16" "__builtin_bswap32"
+                              "__builtin_bswap64"))
+         (= 1 (length args)))
+    (nelisp-cfront-lower--builtin-bswap (nth 1 fn) (car args)))
    ;; direct call to a function DEFINED in this unit: coerce args to the
    ;; declared param types and call the same-unit grammar defun.
    ((and (eq (car fn) 'var)
