@@ -205,6 +205,102 @@ int main(void){
     (should (equal "3+4=7|[id:42]|5|7|OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-defined-variadic-forward-e2e ()
+  "A cfront-compiled function may DEFINE its own variadic `...': the
+SysV AMD64 prologue lays down a 176-byte register-save-area (six GP regs
++ xmm0-7) below the param/let slots, and `__builtin_va_start' fills a
+24-byte `__va_list_tag' (gp_offset / fp_offset / overflow_arg_area /
+reg_save_area) so the list can be forwarded to a `v*printf'-style
+callee.  This is the dominant real-world shape (= `xmlStrPrintf' ->
+`vsnprintf').  Exercises the register path (3 varargs), the
+overflow_arg_area path (5 varargs, 2 spilled to the stack), and a lone
+string vararg — all compared byte-for-byte against glibc `vsnprintf'."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef __builtin_va_list va_list;
+extern int vsnprintf(char *, unsigned long, const char *, va_list);
+int myfmt(char *buf, unsigned long n, const char *fmt, ...){
+  va_list ap; __builtin_va_start(ap, fmt);
+  int r = vsnprintf(buf, n, fmt, ap);
+  __builtin_va_end(ap);
+  return r;
+}
+")
+         (drv "
+#include <stdio.h>
+#include <string.h>
+extern int myfmt(char *, unsigned long, const char *, ...);
+int main(void){
+  char b[64], b2[64], b3[64];
+  int r  = myfmt(b,  sizeof b,  \"%d-%s-%d\", 7, \"ok\", 99);      /* reg path */
+  int r2 = myfmt(b2, sizeof b2, \"%d,%d,%d,%d,%d\", 1,2,3,4,5);  /* overflow */
+  int r3 = myfmt(b3, sizeof b3, \"<%s>\", \"hello\");
+  int ok = (strcmp(b,\"7-ok-99\")==0) && (r==7)
+        && (strcmp(b2,\"1,2,3,4,5\")==0) && (r2==9)
+        && (strcmp(b3,\"<hello>\")==0) && (r3==7);
+  printf(\"%s|%d|%s|%d|%s|%d|%s\\n\", b, r, b2, r2, b3, r3, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "7-ok-99|7|1,2,3,4,5|9|<hello>|7|OK" (cdr res)))
+    (should (= 0 (car res)))))
+
+(ert-deftest nelisp-cfront-defined-variadic-va-arg-e2e ()
+  "A cfront-compiled variadic function may WALK its own `...' with
+`__builtin_va_arg' (GP class): the lowering reads `gp_offset' from the
+`va_list', loads from `reg_save_area + gp_offset' (register path) or
+`overflow_arg_area' (stack path), and advances the cursor.  Covers the
+register path, the overflow path (> 5 GP varargs), signed-`int' sign
+extension of negatives, 8-byte `long', and `char *' pointer args."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef __builtin_va_list va_list;
+extern unsigned long strlen(const char *);
+long sum_ints(int count, ...){
+  va_list ap; __builtin_va_start(ap, count);
+  long s = 0;
+  for (int i = 0; i < count; i++) s += __builtin_va_arg(ap, int);
+  __builtin_va_end(ap);
+  return s;
+}
+long sum_longs(int count, ...){
+  va_list ap; __builtin_va_start(ap, count);
+  long s = 0;
+  for (int i = 0; i < count; i++) s += __builtin_va_arg(ap, long);
+  __builtin_va_end(ap);
+  return s;
+}
+long total_len(int count, ...){
+  va_list ap; __builtin_va_start(ap, count);
+  long t = 0;
+  for (int i = 0; i < count; i++){ const char *s = __builtin_va_arg(ap, char *); t += (long)strlen(s); }
+  __builtin_va_end(ap);
+  return t;
+}
+")
+         (drv "
+#include <stdio.h>
+extern long sum_ints(int, ...);
+extern long sum_longs(int, ...);
+extern long total_len(int, ...);
+int main(void){
+  long a = sum_ints(5, 10,20,30,40,50);                 /* reg path  = 150 */
+  long b = sum_ints(7, 1,2,3,4,5,6,7);                  /* overflow  = 28  */
+  long c = sum_ints(3, -5, 10, -2);                     /* negatives = 3   */
+  long d = sum_longs(4, 1000000000000L, 2L, 3L, 4L);    /* 8-byte    = 1000000000009 */
+  long e = total_len(3, \"ab\", \"cde\", \"f\");             /* ptr walk  = 6   */
+  int ok = (a==150)&&(b==28)&&(c==3)&&(d==1000000000009L)&&(e==6);
+  printf(\"%ld|%ld|%ld|%ld|%ld|%s\\n\", a,b,c,d,e, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "150|28|3|1000000000009|6|OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here

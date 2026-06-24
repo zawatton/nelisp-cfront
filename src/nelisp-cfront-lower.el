@@ -58,6 +58,16 @@ A called name that is a known function but NOT in this set is an extern
 `...').  An extern call to one marks the arguments past the fixed params as
 `:varargs' so the back-end sets the SysV AL (vector-arg count) register —
 without it a `printf'-style call reads a garbage AL and crashes.")
+(defvar nelisp-cfront-lower--cur-variadic-p nil
+  "Non-nil while lowering the body of a C-variadic DEFINING function (one
+whose own parameter list ends with `...').  Gates `va_start' lowering.")
+(defvar nelisp-cfront-lower--cur-named-gp 0
+  "Count of the current function's fixed (named) GP-class parameters —
+pointers and integers.  Seeds the SysV `va_list' `gp_offset' (= 8*N) in
+`va_start' so `va_arg' / a forwarded `v*printf' skips the named registers.")
+(defvar nelisp-cfront-lower--cur-named-fp 0
+  "Count of the current function's fixed (named) FP-class (float/double)
+parameters.  Seeds the SysV `va_list' `fp_offset' (= 48 + 16*N).")
 (defvar nelisp-cfront-lower--tenv nil
   "Type environment (var-name->type) for the current function.")
 (defvar nelisp-cfront-lower--synth nil
@@ -1078,7 +1088,7 @@ so positions stay aligned to call arguments."
             (nelisp-cfront-lower--expr (nth 2 e))
             (nelisp-cfront-lower--expr-float-p (nth 2 e))
             (nelisp-cfront-float-type-p (nth 1 e))))
-    ('va-arg (nelisp-cfront-lower--err :varargs-unsupported e))  ; Tier 3 / upstream
+    ('va-arg (nelisp-cfront-lower--va-arg e))   ; SysV va_list walk (GP class)
     ('fnum (progn (nelisp-cfront-lower--mark-float)               ; double carried as i64 bits
                   (nelisp-cfront-float--double-to-bits (nth 1 e))))
     ('comma (nelisp-cfront-lower--seq (list (nelisp-cfront-lower--expr (nth 1 e))
@@ -1321,6 +1331,55 @@ the grammar, or nil if NAME is not a bswap builtin."
                            (,hi ,(nelisp-cfront-lower--bswap32-g ghi)))
                        (logior (shl ,lo 32) ,hi)))))))))))
 
+(defun nelisp-cfront-lower--va-arg (e)
+  "Lower `va_arg(AP, T)' for a GP-class scalar T (int / long / pointer).
+AP is cfront's 8-byte pointer to the 24-byte SysV `__va_list_tag'.  When
+`gp_offset' < 48 the next argument lives in the register-save-area at
+`reg_save_area + gp_offset' and `gp_offset' advances by 8; otherwise it
+lives at `overflow_arg_area', which advances by 8.  A narrow `int' is
+read from its 8-byte slot's low bytes and sign/zero-extended to its C
+width.  A float/double T (FP class / fp_offset path) is not yet
+supported (loud error rather than a wrong read)."
+  (let* ((ap-node (nth 1 e))
+         (ty (nth 2 e)))
+    (when (nelisp-cfront-float-type-p ty)
+      (nelisp-cfront-lower--err :va-arg-float-unsupported e))
+    (let* ((ap (nelisp-cfront-lower--expr ap-node))
+           (width (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))
+           (g (nelisp-cfront-lower--gensym "vag"))
+           (ov (nelisp-cfront-lower--gensym "vao")))
+      `(let ((,g (ptr-read-u32 ,ap 0)))
+         (if (< ,g 48)
+             (seq (ptr-write-u32 ,ap 0 (+ ,g 8))
+                  ,(nelisp-cfront-lower--normalize-narrow
+                    (nelisp-cfront-lower--load-w
+                     `(+ (ptr-read-u64 ,ap 16) ,g) width)
+                    ty))
+           (let ((,ov (ptr-read-u64 ,ap 8)))
+             (seq (ptr-write-u64 ,ap 8 (+ ,ov 8))
+                  ,(nelisp-cfront-lower--normalize-narrow
+                    (nelisp-cfront-lower--load-w ov width)
+                    ty))))))))
+
+(defun nelisp-cfront-lower--va-start (args)
+  "Lower `va_start(AP, LAST)' inside a C-variadic DEFINING function.
+Allocates the 24-byte SysV `__va_list_tag', stores its address in the AP
+variable (= cfront models `va_list' as an 8-byte pointer local), then
+initialises the four fields via the `va-list-init' grammar op seeded with
+the enclosing function's fixed GP/FP parameter counts.  LAST (the 2nd
+argument, the last named parameter) is implicit in those counts and so is
+ignored.  AP must be a plain local/param variable."
+  (unless nelisp-cfront-lower--cur-variadic-p
+    (nelisp-cfront-lower--err :va-start-outside-variadic args))
+  (let* ((ap-node (car args)))
+    (unless (eq (car-safe ap-node) 'var)
+      (nelisp-cfront-lower--err :va-start-ap-not-var ap-node))
+    (let ((ap (nelisp-cfront-lower--lvar (nth 1 ap-node))))
+      `(seq (setq ,ap (frame-alloc 24))
+            (va-list-init ,ap
+                          ,nelisp-cfront-lower--cur-named-gp
+                          ,nelisp-cfront-lower--cur-named-fp)))))
+
 (defun nelisp-cfront-lower--call (fn args)
   (cond
    ;; GCC bswap intrinsics: expand inline (no external symbol needed).
@@ -1329,6 +1388,16 @@ the grammar, or nil if NAME is not a bswap builtin."
                               "__builtin_bswap64"))
          (= 1 (length args)))
     (nelisp-cfront-lower--builtin-bswap (nth 1 fn) (car args)))
+   ;; GCC variadic intrinsics for a DEFINING function (= `va_start' /
+   ;; `va_end' acting on the function's own `...').  `va_arg' is parsed as
+   ;; a distinct node (handled in `--expr'); the macro spellings expand to
+   ;; the `__builtin_va_*' names, both accepted here.
+   ((and (eq (car fn) 'var)
+         (member (nth 1 fn) '("__builtin_va_start" "va_start")))
+    (nelisp-cfront-lower--va-start args))
+   ((and (eq (car fn) 'var)
+         (member (nth 1 fn) '("__builtin_va_end" "va_end")))
+    0)                                  ; va_end: no-op
    ;; direct call to a function DEFINED in this unit: coerce args to the
    ;; declared param types and call the same-unit grammar defun.
    ((and (eq (car fn) 'var)
@@ -1926,6 +1995,21 @@ unchanged when no name is redeclared."
   (let* ((rty (nth 1 node))
          (name (nelisp-cfront-lower--sym (nth 2 node)))
          (params (nth 3 node))
+         ;; C-variadic DEFINING function: the param list ends with the
+         ;; `(vararg)' ellipsis marker.  Bind the named GP/FP counts (used
+         ;; by `va_start' lowering to seed the SysV `va_list' cursors) and
+         ;; mark the body as variadic so `va_start' is allowed.  A float /
+         ;; double named param is FP-class (xmm); pointers and integers are
+         ;; GP-class.  `&c-varargs' is appended to the grammar param list
+         ;; (below) so the AOT prologue lays down the register-save-area.
+         (real-params (cl-remove-if (lambda (p) (eq (car-safe p) 'vararg)) params))
+         (variadic-p (and (cl-some (lambda (p) (eq (car-safe p) 'vararg)) params) t))
+         (nelisp-cfront-lower--cur-variadic-p variadic-p)
+         (nelisp-cfront-lower--cur-named-fp
+          (cl-count-if (lambda (p) (nelisp-cfront-float-type-p (nth 1 p)))
+                       real-params))
+         (nelisp-cfront-lower--cur-named-gp
+          (- (length real-params) nelisp-cfront-lower--cur-named-fp))
          ;; lexical block scoping: rename locals redeclared with different
          ;; types in sibling scopes so the flat tenv/slot space is correct.
          (body (nelisp-cfront-lower--rename-shadowed (nth 4 node) params))
@@ -2063,8 +2147,13 @@ unchanged when no name is redeclared."
          (full-body (if entry
                         (nelisp-cfront-lower--seq (append entry (list body-g)))
                       body-g))
-         (wrapped (if binds `(let ,binds ,full-body) full-body)))
-    `(defun ,name ,pnames ,wrapped)))
+         (wrapped (if binds `(let ,binds ,full-body) full-body))
+         ;; C-variadic functions carry a trailing `&c-varargs' marker so
+         ;; the AOT defun prologue reserves the SysV register-save-area.
+         (defun-params (if variadic-p
+                           (append pnames (list '&c-varargs))
+                         pnames)))
+    `(defun ,name ,defun-params ,wrapped)))
 
 (defvar nelisp-cfront-lower--skipped nil
   "Accumulator (NAME . REASON) for functions skipped under tolerant
