@@ -94,6 +94,47 @@ int main(void){
     (should (equal "hello, libc! 16 0 OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-multi-fn-module-intra-and-extern-e2e ()
+  "Integration guard for whole-module compilation: several functions in ONE
+cfront-compiled object, mixing same-unit DIRECT calls between defined
+functions (`encode'->`putv', `decode'->`getv') with a PLT `extern-call' to
+libc (`tag'->strlen).  Mirrors the real-SQLite varint cluster shape
+(PutVarint->putVarint64, GetVarint32->GetVarint) at small scale; the whole
+.o links against libc and runs."
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+typedef unsigned char u8;
+typedef unsigned long u64;
+extern u64 strlen(const char *);
+/* leaf, called by encode/decode (same-unit direct calls); LEB128 codec */
+int putv(u8 *p, u64 v){ int n=0; do { u8 c=v&0x7f; v>>=7; if(v) c|=0x80; p[n++]=c; } while(v); return n; }
+u64 getv(const u8 *p){ u64 v=0; int sh=0,i=0; for(;;){ u8 c=p[i++]; v|=(u64)(c&0x7f)<<sh; sh+=7; if(!(c&0x80)) break; } return v; }
+int encode(u8 *p, u64 v){ return putv(p, v); }     /* -> putv */
+u64 decode(const u8 *p){ return getv(p); }         /* -> getv */
+int tag(const char *s){ return (int)strlen(s); }   /* -> libc strlen (extern) */
+")
+         (drv "
+#include <stdio.h>
+typedef unsigned char u8;
+typedef unsigned long u64;
+extern int encode(u8*, u64);
+extern u64 decode(const u8*);
+extern int tag(const char*);
+int main(void){
+  u8 b[12]; u64 vals[]={0,1,127,128,300,0xfedcba9876543210UL};
+  int ok=1;
+  for(int i=0;i<6;i++){ int n=encode(b,vals[i]); u64 back=decode(b); if(back!=vals[i]||n<1) ok=0; }
+  int t = tag(\"hello\");      /* 5 */
+  ok = ok && (t==5);
+  printf(\"tag=%d %s\\n\", t, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "tag=5 OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here
