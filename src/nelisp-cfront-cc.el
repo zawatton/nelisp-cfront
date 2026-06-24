@@ -56,7 +56,12 @@ one child per line, readable with `read' and feedable straight to
 `provide'.  Returns the grammar form."
   (ignore feature)
   (let* ((ast (nelisp-cfront-parse csource))
-         (grammar (nelisp-cfront-lower-program ast))
+         (nelisp-cfront-lower--skipped nil)
+         ;; tolerant: emit every function that lowers; record the rest as a
+         ;; comment so a whole real-world C file (one un-lowerable function
+         ;; would otherwise abort it) still produces a usable `.el'.
+         (grammar (nelisp-cfront-lower-program ast t))
+         (skipped (nreverse nelisp-cfront-lower--skipped))
          (name (file-name-nondirectory elpath))
          ;; escape raw bytes (data-blob unibyte strings) so they round-trip
          ;; through `read'; full structure, no abbreviation.
@@ -65,13 +70,22 @@ one child per line, readable with `read' and feedable straight to
          (print-length nil)
          (print-level nil)
          (print-quoted t)
-         (print-circle nil))
+         ;; `t': a large lowered program shares sub-structure (reused type
+         ;; plists / literals); without this `prin1' aborts with "Apparently
+         ;; circular structure".  `#N='/`#N#' round-trip through `read'.
+         (print-circle t))
     (with-temp-file elpath
       (insert ";;; " name
               " --- nelisp-cc grammar generated from C by nelisp-cfront"
               "  -*- lexical-binding: t; -*-\n")
       (insert ";; Auto-generated — do not edit.  One `(seq ...)' nelisp form;\n")
-      (insert ";; feed to `nelisp-aot-compile-to-object' (or load + compile).\n\n")
+      (insert ";; feed to `nelisp-aot-compile-to-object' (or load + compile).\n")
+      (when skipped
+        (insert (format ";; %d function(s) could not be lowered yet and were SKIPPED:\n"
+                        (length skipped)))
+        (dolist (s skipped)
+          (insert (format ";;   %s  (%s)\n" (car s) (cdr s)))))
+      (insert "\n")
       (if (and (consp grammar) (eq (car grammar) 'seq))
           (progn
             (insert "(seq\n")
@@ -81,6 +95,11 @@ one child per line, readable with `read' and feedable straight to
             (insert ")\n"))
         (progn (prin1 grammar (current-buffer)) (insert "\n")))
       (insert "\n;;; " name " ends here\n"))
+    (when skipped
+      (message "[emit-el] %d function(s) skipped (not yet lowerable): %s"
+               (length skipped)
+               (mapconcat (lambda (s) (format "%s(%s)" (car s) (cdr s)))
+                          (seq-take skipped 6) ", ")))
     grammar))
 
 (defun nelisp-cfront-emit-el-file (cfile elpath &optional feature)

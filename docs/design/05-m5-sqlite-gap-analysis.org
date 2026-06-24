@@ -761,3 +761,25 @@ generated `.el' is genuine, natively-compilable nelisp source, not just
 text.
 
 Pipeline now: C -> lex -> parse -> lower -> *emit .el* (or -> AOT -> .o).
+
+* §23 whole real SQLite -> one nelisp .el (the goal, at scale)
+
+`lower-program' aborted on the first un-lowerable function, so a 2.4 MB
+real `sqlite3.pp.c' could never emit.  Added a TOLERANT mode
+(`lower-program ... t'): a function that fails to lower is recorded in
+`nelisp-cfront-lower--skipped' (NAME . REASON) and skipped, the rest
+emitted.  `emit-el' uses it and writes the skip list as header comments.
+`print-circle' t (a huge program shares sub-structure; `prin1' otherwise
+aborts "Apparently circular structure").
+
+Result: `make emit-el FILE=/tmp/sqlite3.pp.c OUT=/tmp/sqlite3.el' produces
+a *6.0 MB nelisp `.el'* — 2368 SQLite functions (+ helpers = 2380 defuns,
+3799 top-level forms incl. global/string/static data-blobs); 24 functions
+skipped (listed with reason: varargs / the deref/addr-of/unknown-struct
+tail / yy_reduce excessive-lisp-nesting).  The file `read's back cleanly
+in 0.1 s to one `(seq ...)' form (the `#N=' sharing round-trips) — i.e. a
+real C codebase turned into valid, natively-compilable nelisp source.
+
+Next: whole-program AOT (read the .el, compile-to-object, link) — the 79
+per-function `:unresolved-label' artifacts resolve once all defuns are in
+one unit; calls to the 24 skipped funcs stay extern (link-provided).

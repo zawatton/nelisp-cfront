@@ -1859,10 +1859,18 @@ unchanged when no name is redeclared."
          (wrapped (if binds `(let ,binds ,full-body) full-body)))
     `(defun ,name ,pnames ,wrapped)))
 
-(defun nelisp-cfront-lower-program (ast)
+(defvar nelisp-cfront-lower--skipped nil
+  "Accumulator (NAME . REASON) for functions skipped under tolerant
+`lower-program'.  The CALLER binds it to nil and reads it back; tolerant
+lowering pushes each un-lowerable function here instead of aborting.")
+
+(defun nelisp-cfront-lower-program (ast &optional tolerant)
   "Lower AST `(program TOP...)' to a grammar `(seq (defun ...) ...)'.
 Includes the `nelisp_cfront__zero' helper.  Globals/prototypes are
-skipped in the MVP (functions only)."
+skipped in the MVP (functions only).  When TOLERANT, a function that fails
+to lower is skipped (its (NAME . REASON) pushed to
+`nelisp-cfront-lower--skipped') instead of aborting the whole program — so
+a real-world C file emits the functions that DO lower."
   (unless (eq (car ast) 'program)
     (nelisp-cfront-lower--err :not-a-program ast))
   (let* ((nelisp-cfront-lower--structs (nelisp-cfront-type-build-structs ast))
@@ -1885,7 +1893,15 @@ skipped in the MVP (functions only)."
          (funcs nil))
     (dolist (top (cdr ast))
       (pcase (car top)
-        ('func (push (nelisp-cfront-lower--func top) funcs))
+        ('func (if tolerant
+                   (condition-case e
+                       (push (nelisp-cfront-lower--func top) funcs)
+                     (error
+                      (let ((d (cdr e)))
+                        (push (cons (nth 2 top)
+                                    (if (keywordp (car-safe d)) (car d) (car e)))
+                              nelisp-cfront-lower--skipped))))
+                 (push (nelisp-cfront-lower--func top) funcs)))
         ('proto nil)                          ; ignore prototypes
         ('global nil)                         ; data emitted from --globals below
         ('struct-def nil)                     ; layout already in the table
