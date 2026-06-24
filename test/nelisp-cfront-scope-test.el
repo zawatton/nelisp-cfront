@@ -156,6 +156,27 @@ int main(void){
     (should (equal "0 39 37 1 2 3" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-scope-address-of-param-e2e ()
+  "Taking a scalar parameter's address (`&x') spills it to a frame block at
+entry, so it can be passed by pointer and mutated through it."
+  (unless (nelisp-cfront-scope-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-scope-test--run "
+static void incp(int *p){ *p += 5; }
+int viaaddr(int x){ incp(&x); return x; }
+int dblref(int n){ int *p = &n; *p = *p * 2; return n; }
+long sumptr(long a){ long *q = &a; return *q + a; }
+" "
+#include <stdio.h>
+extern int viaaddr(int); extern int dblref(int); extern long sumptr(long);
+int main(void){
+  printf(\"%d %d %ld\\n\", viaaddr(10), dblref(7), sumptr(21));
+  return (viaaddr(10)==15 && dblref(7)==14 && sumptr(21)==42) ? 0 : 1;
+}
+")))
+    (should (equal "15 14 42" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-scope-test)
 
 ;;; nelisp-cfront-scope-test.el ends here

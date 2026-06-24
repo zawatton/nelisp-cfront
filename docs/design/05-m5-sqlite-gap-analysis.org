@@ -557,3 +557,20 @@ Result: =:non-constant-array-size= 41 → 13, coverage 94.5% → *95.6%*
 (2286 / 2392).  Remaining 13 are genuine VLAs / non-constant dims.  Top
 buckets now: =:unknown-struct= 47 (incomplete-type tail), =:addr-of-non-
 memory-var= 27 (=&param= / =&otherGlobal=).
+
+* §14 =:addr-of-non-memory-var= → address-taken params (95.6% → 96.2%)
+
+The 27 split ~half =&param= (=&x= on a scalar parameter) and ~half
+=&global= on globals with a *designated* initializer that =--lay= skips
+(=.field=='-style io-method tables — deferred).
+
+Fixed =&param=: an address-taken scalar param is spilled to a frame block
+at entry.  The value arrives in a register under a =nlcf_pin_NAME= temp;
+=--func= frame-allocs a block bound to the param's =--lvar= slot, stores
+the (narrow-normalized) incoming value into it, and adds the param to
+=--mem-vars= so refs load through the block and =&p= returns its address —
+exactly the address-taken-local path, extended to params.
+
+Result: =:addr-of-non-memory-var= 27 → 11, coverage 95.6% → *96.2%*
+(2301 / 2392).  The residual 11 are =&global= on designated-initializer
+globals (need parser designator preservation + by-name =--lay= placement).

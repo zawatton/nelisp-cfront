@@ -1553,9 +1553,27 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
          (body (nth 4 node))
          (void-p (and (eq (plist-get rty :base) 'void) (= 0 (plist-get rty :ptr))))
          (nelisp-cfront-lower--ret-float (nelisp-cfront-float-type-p rty))
-         (pnames (delq nil (mapcar (lambda (p) (and (nth 2 p)
-                                                    (nelisp-cfront-lower--lvar (nth 2 p))))
-                                   params)))
+         (addr-taken (nelisp-cfront-lower--collect-addr-taken body nil))
+         ;; Address-taken scalar params must live in a frame block so `&p'
+         ;; and through-pointer access work.  The value arrives in a register
+         ;; under a `nlcf_pin_NAME' temp and is spilled into the block at
+         ;; entry (param-spills below); the param then behaves like an
+         ;; address-taken scalar local.
+         (addr-param-names
+          (delq nil (mapcar
+                     (lambda (p)
+                       (and (nth 2 p)
+                            (member (nth 2 p) addr-taken)
+                            (not (nelisp-cfront-lower--aggregate-type-p (nth 1 p)))
+                            (nth 2 p)))
+                     params)))
+         (pnames (delq nil (mapcar
+                            (lambda (p)
+                              (and (nth 2 p)
+                                   (if (member (nth 2 p) addr-param-names)
+                                       (intern (concat "nlcf_pin_" (nth 2 p)))
+                                     (nelisp-cfront-lower--lvar (nth 2 p)))))
+                            params)))
          (locals (nreverse (delete-dups (nelisp-cfront-lower--collect-decls body nil))))
          ;; `static' locals are lifted to module globals (Doc 06 follow-on):
          ;; STATIC-MAP is NAME->(SYM . RESOLVED-TYPE); their data-blobs were
@@ -1575,18 +1593,21 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                   ;; same-named param/local appended before them (Doc 06 Step B).
                   (mapcar (lambda (g) (cons (car g) (plist-get (cdr g) :type)))
                           nelisp-cfront-lower--globals)))
-         ;; Locals needing a frame-alloc block: arrays / struct-by-value
-         ;; (always) and address-taken scalars.  (Address-taken *params*
-         ;; would need an entry spill; for now `&param' signals via --addr.)
-         (addr-taken (nelisp-cfront-lower--collect-addr-taken body nil))
+         ;; Vars needing a frame-alloc block: address-taken scalar params,
+         ;; plus locals that are arrays / struct-by-value or address-taken.
          (nelisp-cfront-lower--mem-vars
-          (delq nil (mapcar
-                     (lambda (v)
-                       (let ((ty (cdr (assoc v nelisp-cfront-lower--tenv))))
-                         (when (and ty (or (nelisp-cfront-lower--aggregate-type-p ty)
-                                           (member v addr-taken)))
-                           (cons v ty))))
-                     locals)))
+          (append
+           (delq nil (mapcar (lambda (p)
+                               (and (member (nth 2 p) addr-param-names)
+                                    (cons (nth 2 p) (nth 1 p))))
+                             params))
+           (delq nil (mapcar
+                      (lambda (v)
+                        (let ((ty (cdr (assoc v nelisp-cfront-lower--tenv))))
+                          (when (and ty (or (nelisp-cfront-lower--aggregate-type-p ty)
+                                            (member v addr-taken)))
+                            (cons v ty))))
+                      locals))))
          (nelisp-cfront-lower--synth nil)
          (nelisp-cfront-lower--brk-stack nil)
          (nelisp-cfront-lower--brk-counter 0)
@@ -1622,22 +1643,47 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                        locals))
          (synth-binds (mapcar (lambda (v) (list v (list nelisp-cfront-lower--zero-fn)))
                               (reverse nelisp-cfront-lower--synth)))
-         (binds (append local-binds synth-binds))
+         ;; address-taken params get their own frame block (the `--lvar' slot
+         ;; holds the block address, like an address-taken local).
+         (addr-param-binds
+          (mapcar (lambda (nm)
+                    (list (nelisp-cfront-lower--lvar nm)
+                          (list 'frame-alloc
+                                (nelisp-cfront-type-size
+                                 (cdr (assoc nm nelisp-cfront-lower--mem-vars))
+                                 nelisp-cfront-lower--structs))))
+                  addr-param-names))
+         (binds (append addr-param-binds local-binds synth-binds))
+         ;; Spill each address-taken param's incoming register value
+         ;; (`nlcf_pin_NAME', narrow-normalized) into its frame block.
+         (param-spills
+          (mapcar (lambda (p)
+                    (let* ((nm (nth 2 p)) (ty (nth 1 p)))
+                      (nelisp-cfront-lower--store-w
+                       (nelisp-cfront-lower--lvar nm)
+                       (nelisp-cfront-type-size ty nelisp-cfront-lower--structs)
+                       (nelisp-cfront-lower--normalize-narrow
+                        (intern (concat "nlcf_pin_" nm)) ty))))
+                  (cl-remove-if-not (lambda (p) (member (nth 2 p) addr-param-names))
+                                    params)))
          ;; SysV passes a narrow int arg in the low bits of a 64-bit
          ;; register with the high bits unspecified (gcc zero-extends), so
          ;; re-normalize each narrow-int param to its C width at entry —
          ;; otherwise a negative `int' arg reads as a large positive i64.
+         ;; (Address-taken params are handled by the spill above instead.)
          (param-norms
           (delq nil (mapcar
                      (lambda (p)
                        (and (nth 2 p)
+                            (not (member (nth 2 p) addr-param-names))
                             (nelisp-cfront-lower--narrow-int-width (nth 1 p))
                             (let ((g (nelisp-cfront-lower--lvar (nth 2 p))))
                               `(setq ,g ,(nelisp-cfront-lower--normalize-narrow
                                           g (nth 1 p))))))
                      params)))
-         (full-body (if param-norms
-                        (nelisp-cfront-lower--seq (append param-norms (list body-g)))
+         (entry (append param-spills param-norms))
+         (full-body (if entry
+                        (nelisp-cfront-lower--seq (append entry (list body-g)))
                       body-g))
          (wrapped (if binds `(let ,binds ,full-body) full-body)))
     `(defun ,name ,pnames ,wrapped)))
