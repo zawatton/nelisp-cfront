@@ -437,11 +437,13 @@ error' on anything not representable so the caller can skip the global."
                                 (nelisp-cfront-lower--float32-bytes v)
                               (nelisp-cfront-lower--pack-int
                                (nelisp-cfront-float--double-to-bits v) 8)))))
-              ;; integer scalar
+              ;; integer scalar — use the parser's full integer constant
+              ;; evaluator (handles comparison / bitwise / logical ops like
+              ;; `1==1', which a struct initializer often contains).
               ((memq base '(char short int long))
                (place off (nelisp-cfront-lower--pack-int
                            (if (null init) 0
-                             (truncate (nelisp-cfront-lower--const-number init)))
+                             (nelisp-cfront-parse--const-eval init))
                            (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))))
               (t (nelisp-cfront-lower--err :bad-scalar-init ty))))))
       (lay 0 ty init))
@@ -774,6 +776,9 @@ so we never try to load a whole struct/array.  Scalars are loaded."
       ('if (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc))
            (setq acc (nelisp-cfront-lower--collect-decls (nth 3 node) acc)))
       ('while (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc)))
+      ('do-while (setq acc (nelisp-cfront-lower--collect-decls (nth 1 node) acc)))
+      ('switch (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc)))
+      ('label (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc)))
       ('for (dolist (k (list (nth 1 node) (nth 4 node)))
               (setq acc (nelisp-cfront-lower--collect-decls k acc))))
       (_ nil)))
@@ -789,6 +794,9 @@ so we never try to load a whole struct/array.  Scalars are loaded."
       ('if (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc))
            (setq acc (nelisp-cfront-lower--collect-decl-types (nth 3 node) acc)))
       ('while (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc)))
+      ('do-while (setq acc (nelisp-cfront-lower--collect-decl-types (nth 1 node) acc)))
+      ('switch (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc)))
+      ('label (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc)))
       ('for (dolist (k (list (nth 1 node) (nth 4 node)))
               (setq acc (nelisp-cfront-lower--collect-decl-types k acc))))
       (_ nil)))

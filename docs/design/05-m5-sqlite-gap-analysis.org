@@ -481,3 +481,30 @@ vaddr → fails in ET_REL).  So global support is the next *milestone*
 (upstream object-mode data+reloc op, then cfront global emission), not a
 quick bucket fix.  Full design + layered plan in *Doc 06*.
 
+
+* §11 Post-Doc-06: lowering coverage 75% → 91% (2026-06-24)
+
+After the global-data milestone (Doc 06 Steps A–C-3 + D took coverage to
+88.3%), two *struct-completeness / local-type* fixes (not global, not new
+ops) lifted it past 91%:
+
+- =:unknown-struct= / =:deref-non-pointer= were dominated not by missing
+  struct *types* (223 struct-defs, 222 lay out fine incl. =sqlite3=) but
+  by *locals declared in nested scopes typing as =long='.
+  =--collect-decls= / =--collect-decl-types= only recursed into
+  =block=/=if=/=while=/=for= — never =switch=/=do-while=/labeled
+  statements.  A =LookasideSlot *p= declared in a =switch= case fell back
+  to =long=, so =p->next= signalled =:unknown-struct=.  Adding the missing
+  recursions: +28 functions.
+
+- A big global struct (=sqlite3Config=, referenced by dozens of functions)
+  was *skipped* because its positional initializer contains =1==1=, and
+  =--lay='s integer-field path used =--const-number= (no comparison
+  operators).  Switching integer struct fields to the parser's full
+  =--const-eval= registered =sqlite3Config= (→ =.data=): +48 functions.
+
+Result: =make lower-gap FILE=/tmp/sqlite3.pp.c= → *2187 / 2392 = 91.4%*.
+Residual buckets are now smaller and mixed: =:deref-non-pointer= 66,
+=:unknown-struct= 49 (a true incomplete-type tail + a few globals still
+skipped), =:addr-of-non-memory-var= 40, =:non-constant-array-size= 37,
+=:varargs= 7.
