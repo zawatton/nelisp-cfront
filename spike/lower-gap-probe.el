@@ -53,6 +53,8 @@
            (nelisp-cfront-lower--string-pool nil)
            (nelisp-cfront-lower--string-counter 0)
            (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+           (nelisp-cfront-lower--static-blobs nil)
+           (nelisp-cfront-lower--static-counter 0)
            (nelisp-cfront-lower--uses-float nil))
       (dolist (top funcs)
         (condition-case e

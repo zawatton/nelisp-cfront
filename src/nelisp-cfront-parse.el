@@ -222,11 +222,15 @@ each constant into `--enum-consts' with C auto-increment semantics."
                 (nelisp-cfront-parse--typedef-lookup (nth 1 tk))))))
 
 (defun nelisp-cfront-parse--parse-type ()
-  "Parse a type-specifier sequence + pointer stars into a type plist."
+  "Parse a type-specifier sequence + pointer stars into a type plist.
+A `static' storage class is recorded as `:storage static' on the result so
+the lowerer can lift a function-static local to a module global."
+  (let ((static-p nil))
   ;; leading storage-class / qualifier keywords
   (while (and (nelisp-cfront-parse--at 'keyword)
               (member (nelisp-cfront-parse--pval)
                       '("const" "static" "extern" "register" "volatile" "inline")))
+    (when (equal (nelisp-cfront-parse--pval) "static") (setq static-p t))
     (nelisp-cfront-parse--advance))
   (if (and (nelisp-cfront-parse--at 'ident)
            (nelisp-cfront-parse--typedef-lookup (nelisp-cfront-parse--pval)))
@@ -240,14 +244,16 @@ each constant into `--enum-consts' with C auto-increment semantics."
           (if (nelisp-cfront-parse--at-punct "*")
               (progn (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
             (nelisp-cfront-parse--advance)))   ; skip pointer qualifier
-        (plist-put (copy-sequence bt) :ptr ptr))
+        (let ((r (plist-put (copy-sequence bt) :ptr ptr)))
+          (if static-p (append r '(:storage static)) r)))
     (let ((specs nil) (struct-name nil) (struct-fields nil) (unsigned nil)
           (is-union nil))
       (while (and (nelisp-cfront-parse--at 'keyword)
                   (member (nelisp-cfront-parse--pval) nelisp-cfront-parse--type-keywords))
       (let ((w (nth 1 (nelisp-cfront-parse--advance))))
         (cond
-         ((member w '("const" "static" "extern")) nil) ; ignore qualifiers/storage
+         ((string= w "static") (setq static-p t)) ; storage: lift to global
+         ((member w '("const" "extern")) nil) ; ignore qualifiers/storage
          ((string= w "unsigned") (setq unsigned t))
          ((string= w "signed") (push "int" specs))   ; `signed' alone => int
          ((or (string= w "struct") (string= w "union"))
@@ -287,7 +293,8 @@ each constant into `--enum-consts' with C auto-increment semantics."
               (when unsigned '(:unsigned t))
               (when struct-name (list :struct struct-name))
               (when struct-fields (list :fields struct-fields))
-              (when is-union '(:union t)))))))
+              (when is-union '(:union t))
+              (when static-p '(:storage static))))))))
 
 (defun nelisp-cfront-parse--skip-paren-group ()
   "Skip a balanced `( ... )' group at point (point must be at `(')."

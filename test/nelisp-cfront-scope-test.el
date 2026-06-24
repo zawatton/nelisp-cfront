@@ -129,6 +129,33 @@ int main(void){
     (should (equal "10 -5 dbl neg 7 9" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-scope-function-static-locals-e2e ()
+  "A function-`static' local is lifted to a module global: a read-only
+const array (implicit `[]' size) is indexed, and a mutable scalar persists
+its value across calls."
+  (unless (nelisp-cfront-scope-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-scope-test--run "
+int logest(unsigned long x){
+  static int a[] = { 0, 2, 3, 5, 6, 7, 8, 9 };
+  int y = 40;
+  if( x<8 ){ if( x<2 ) return 0; while( x<8 ){ y -= 10; x <<= 1; } }
+  return a[x&7] + y - 10;
+}
+int counter(void){ static int n = 0; n += 1; return n; }
+" "
+#include <stdio.h>
+extern int logest(unsigned long); extern int counter(void);
+int main(void){
+  int c1=counter(), c2=counter(), c3=counter();
+  printf(\"%d %d %d %d %d %d\\n\", logest(1), logest(15), logest(13), c1, c2, c3);
+  return (logest(1)==0 && logest(15)==39 && logest(13)==37 &&
+          c1==1 && c2==2 && c3==3) ? 0 : 1;
+}
+")))
+    (should (equal "0 39 37 1 2 3" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-scope-test)
 
 ;;; nelisp-cfront-scope-test.el ends here

@@ -93,6 +93,19 @@ as a side effect of lowering function bodies, then emitted by
 (defvar nelisp-cfront-lower--string-counter 0
   "Counter for generating unique string-pool symbol names.")
 
+(defvar nelisp-cfront-lower--static-blobs nil
+  "Module accumulator of lifted `static' locals (Doc 06 follow-on): a list
+of (SYM :section S :bytes B :relocs R), emitted as `data-blob's by
+`lower-program'.  A function-`static' local has static storage, so it is
+hoisted to a uniquely-named module global instead of a frame slot.")
+
+(defvar nelisp-cfront-lower--static-counter 0
+  "Counter for unique lifted-static-local symbol names.")
+
+(defvar nelisp-cfront-lower--static-locals nil
+  "Per-function alist NAME->SYM mapping a `static' local to its lifted
+module-global symbol; a reference lowers via `(data-addr SYM)'.")
+
 (defconst nelisp-cfront-lower--zero-fn 'nelisp_cfront__zero
   "Per-object helper returning a non-foldable 0 (forces frame-slot let).")
 
@@ -692,6 +705,8 @@ descending word widths (u64/u32/u16/u8) at constant offsets."
     ('var (cond
            ((nelisp-cfront-lower--mem-var (nth 1 e))
             (nelisp-cfront-lower--lvar (nth 1 e)))    ; frame-alloc block address
+           ((nelisp-cfront-lower--static-local-sym (nth 1 e))
+            `(data-addr ,(nelisp-cfront-lower--static-local-sym (nth 1 e))))
            ((nelisp-cfront-lower--global-var-p (nth 1 e))
             `(data-addr ,(intern (nth 1 e))))         ; rodata global symbol address
            (t (nelisp-cfront-lower--err :addr-of-non-memory-var e))))
@@ -778,10 +793,13 @@ so we never try to load a whole struct/array.  Scalars are loaded."
 ;;; --- collect mutable locals (for the outer frame-slot let) -----------
 
 (defun nelisp-cfront-lower--collect-decls (node acc)
-  "Collect local declaration names from NODE into ACC (a list); return ACC."
+  "Collect local declaration names from NODE into ACC (a list); return ACC.
+`static' locals are skipped — they are lifted to module globals, not
+frame slots."
   (when (consp node)
     (pcase (car node)
-      ('decl (push (nth 2 node) acc))
+      ('decl (unless (eq (plist-get (nth 1 node) :storage) 'static)
+               (push (nth 2 node) acc)))
       ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-decls d acc))))
       ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decls s acc))))
       ('if (setq acc (nelisp-cfront-lower--collect-decls (nth 2 node) acc))
@@ -796,10 +814,13 @@ so we never try to load a whole struct/array.  Scalars are loaded."
   acc)
 
 (defun nelisp-cfront-lower--collect-decl-types (node acc)
-  "Collect (NAME . TYPE) for local declarations in NODE into ACC."
+  "Collect (NAME . TYPE) for local declarations in NODE into ACC.
+`static' locals are skipped here — their (resolved) type is added to the
+type env separately when they are lifted to globals."
   (when (consp node)
     (pcase (car node)
-      ('decl (push (cons (nth 2 node) (nth 1 node)) acc))
+      ('decl (unless (eq (plist-get (nth 1 node) :storage) 'static)
+               (push (cons (nth 2 node) (nth 1 node)) acc)))
       ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types d acc))))
       ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types s acc))))
       ('if (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc))
@@ -812,6 +833,53 @@ so we never try to load a whole struct/array.  Scalars are loaded."
               (setq acc (nelisp-cfront-lower--collect-decl-types k acc))))
       (_ nil)))
   acc)
+
+(defun nelisp-cfront-lower--collect-static-decls (node acc)
+  "Collect (NAME TYPE INIT) for `static' local declarations in NODE."
+  (when (consp node)
+    (pcase (car node)
+      ('decl (when (eq (plist-get (nth 1 node) :storage) 'static)
+               (push (list (nth 2 node) (nth 1 node) (nth 3 node)) acc)))
+      ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-static-decls d acc))))
+      ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-static-decls s acc))))
+      ('if (setq acc (nelisp-cfront-lower--collect-static-decls (nth 2 node) acc))
+           (setq acc (nelisp-cfront-lower--collect-static-decls (nth 3 node) acc)))
+      ('while (setq acc (nelisp-cfront-lower--collect-static-decls (nth 2 node) acc)))
+      ('do-while (setq acc (nelisp-cfront-lower--collect-static-decls (nth 1 node) acc)))
+      ('switch (setq acc (nelisp-cfront-lower--collect-static-decls (nth 2 node) acc)))
+      ('label (setq acc (nelisp-cfront-lower--collect-static-decls (nth 2 node) acc)))
+      ('for (dolist (k (list (nth 1 node) (nth 4 node)))
+              (setq acc (nelisp-cfront-lower--collect-static-decls k acc))))
+      (_ nil)))
+  acc)
+
+(defun nelisp-cfront-lower--static-local-sym (name)
+  "Lifted module-global symbol for `static' local NAME, or nil."
+  (cdr (assoc name nelisp-cfront-lower--static-locals)))
+
+(defun nelisp-cfront-lower--process-statics (body)
+  "Lift `static' locals in BODY to module globals.  Returns an alist
+NAME->(SYM . RESOLVED-TYPE); pushes each one's data-blob spec onto
+`--static-blobs'.  A static local that cannot be laid out is left out (its
+references then fall back to the old frame path / fail as before)."
+  (let ((statics (nreverse (nelisp-cfront-lower--collect-static-decls body nil)))
+        (written (nelisp-cfront-lower--collect-written-globals body))
+        (out nil))
+    (dolist (s statics)
+      (let* ((name (nth 0 s)) (ty (nth 1 s)) (init (nth 2 s))
+             (rty (nelisp-cfront-lower--resolve-array-dim ty init))
+             (img (ignore-errors
+                    (nelisp-cfront-lower--global-image
+                     rty init (and (member name written) t)))))
+        (when (and img (not (assoc name out)))
+          (let ((sym (intern (format "nlcf_sl_%d_%s"
+                                     nelisp-cfront-lower--static-counter name))))
+            (setq nelisp-cfront-lower--static-counter
+                  (1+ nelisp-cfront-lower--static-counter))
+            (push (list sym :section (nth 0 img) :bytes (nth 1 img) :relocs (nth 2 img))
+                  nelisp-cfront-lower--static-blobs)
+            (push (cons name (cons sym rty)) out)))))
+    (nreverse out)))
 
 (defun nelisp-cfront-lower--collect-func-types (program)
   "Alist NAME->ret-type for `func'/`proto' top-levels in PROGRAM."
@@ -854,9 +922,11 @@ so positions stay aligned to call arguments."
                (nelisp-cfront-lower--lvar name)
                (nelisp-cfront-type-size (cdr (nelisp-cfront-lower--mem-var name))
                                         nelisp-cfront-lower--structs)))
-             ((nelisp-cfront-lower--global-var-p name)
-              ;; rodata global: a scalar loads through `(data-addr NAME)',
-              ;; an array/struct decays to that address (handled by --rvalue).
+             ((or (nelisp-cfront-lower--static-local-sym name)
+                  (nelisp-cfront-lower--global-var-p name))
+              ;; lifted static local / rodata global: a scalar loads through
+              ;; `(data-addr SYM)', an array/struct decays to that address
+              ;; (both handled by --rvalue via --addr).
               (nelisp-cfront-lower--rvalue e))
              ;; aggregate local decays to its block address (= the slot value);
              ;; plain scalar reads its value slot directly.
@@ -992,6 +1062,7 @@ matches C, so the raw value is used directly."
      ;; a `setq' on a free symbol, which would mean a NeLisp special var).
      ((and (eq (car lhs) 'var)
            (not (nelisp-cfront-lower--mem-var-scalar-p (nth 1 lhs)))
+           (not (nelisp-cfront-lower--static-local-sym (nth 1 lhs)))
            (not (nelisp-cfront-lower--global-var-p (nth 1 lhs))))
        (let ((name (nelisp-cfront-lower--lvar (nth 1 lhs))))
          (if (string= op "=")
@@ -1297,6 +1368,9 @@ Only a single top-level forward label (the cleanup pattern) is supported."
   (pcase (car s)
     ('decl (let ((init (nth 3 s)) (cname (nth 2 s)) (ty (nth 1 s)))
              (cond
+              ;; `static' local: lifted to a module global, initialized in its
+              ;; data-blob — no runtime statement.
+              ((eq (plist-get ty :storage) 'static) 0)
               ;; uninitialised, or aggregate init list (local array/struct
               ;; `{...}' init deferred)
               ((or (null init) (and (consp init) (eq (car init) 'init-list))) 0)
@@ -1483,12 +1557,20 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
                                                     (nelisp-cfront-lower--lvar (nth 2 p))))
                                    params)))
          (locals (nreverse (delete-dups (nelisp-cfront-lower--collect-decls body nil))))
+         ;; `static' locals are lifted to module globals (Doc 06 follow-on):
+         ;; STATIC-MAP is NAME->(SYM . RESOLVED-TYPE); their data-blobs were
+         ;; pushed onto `--static-blobs' for `lower-program' to emit.
+         (static-map (nelisp-cfront-lower--process-statics body))
+         (nelisp-cfront-lower--static-locals
+          (mapcar (lambda (e) (cons (car e) (cadr e))) static-map))
          (nelisp-cfront-lower--local-names
           (append (delq nil (mapcar (lambda (p) (nth 2 p)) params)) locals))
          (nelisp-cfront-lower--tenv
           (append (delq nil (mapcar (lambda (p) (and (nth 2 p) (cons (nth 2 p) (nth 1 p))))
                                     params))
                   (nelisp-cfront-lower--collect-decl-types body nil)
+                  ;; lifted static locals: resolved type (so sizeof / indexing work)
+                  (mapcar (lambda (e) (cons (car e) (cddr e))) static-map)
                   ;; globals are visible for type inference but shadowed by any
                   ;; same-named param/local appended before them (Doc 06 Step B).
                   (mapcar (lambda (g) (cons (car g) (plist-get (cdr g) :type)))
@@ -1578,6 +1660,10 @@ skipped in the MVP (functions only)."
          ;; for sizing and the string pool for pointer relocs), exposed to
          ;; every function's type env, emitted as `data-blob's below.
          (nelisp-cfront-lower--globals (nelisp-cfront-lower--collect-globals ast))
+         ;; Lifted `static' locals accumulate here while lowering bodies, then
+         ;; are emitted as `data-blob's alongside the globals below.
+         (nelisp-cfront-lower--static-blobs nil)
+         (nelisp-cfront-lower--static-counter 0)
          (nelisp-cfront-lower--uses-float nil)
          (funcs nil))
     (dolist (top (cdr ast))
@@ -1602,6 +1688,13 @@ skipped in the MVP (functions only)."
                      `(data-blob ,(cdr e)
                                  ,(nelisp-cfront-lower--string-bytes (car e)) rodata))
                    (reverse nelisp-cfront-lower--string-pool))
+           ;; lifted static locals (data-blob per (SYM :section :bytes :relocs))
+           (mapcar (lambda (s)
+                     `(data-blob ,(car s)
+                                 ,(plist-get (cdr s) :bytes)
+                                 ,(plist-get (cdr s) :section)
+                                 ,(plist-get (cdr s) :relocs)))
+                   (reverse nelisp-cfront-lower--static-blobs))
            (cons `(defun ,nelisp-cfront-lower--zero-fn () 0)
                  (append (when nelisp-cfront-lower--uses-float
                            (nelisp-cfront-float-helper-defuns))

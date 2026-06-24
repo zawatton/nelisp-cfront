@@ -535,3 +535,25 @@ Result: =:deref-non-pointer= 66 → 2, coverage 92.3% → *94.5%* (2261 /
 2392).  Remaining top buckets: =:unknown-struct= 48 (true incomplete-type
 tail), =:non-constant-array-size= 41, =:addr-of-non-memory-var= 27,
 =:varargs= 7.
+
+* §13 =:non-constant-array-size= → function-static locals (94.5% → 95.6%)
+
+Precise diagnosis (advise =type--const=): all 38 actionable cases had a
+=:array t= (implicit =[]=) dimension reaching =type-size=.  The trigger
+was *function-=static= locals* — =static LogEst a[] = {0,2,3,5,6,7,8,9};=
+inside =sqlite3LogEst=, a read-only lookup table.  The parser *discarded*
+=static=, so it was treated as an automatic local: frame-alloc needs the
+full array size, but the implicit =[]= has no const dimension.
+
+Fix (cfront-only): the parser tags =static= as =:storage static= on the
+decl type; the lowerer *lifts* each function-static local to a uniquely-
+named module global (=nlcf_sl_N_NAME=) — exactly the global-data path
+(rodata for a read-only table, =.data=/=.bss= for a mutable scalar, the
+implicit =[]= resolved from the initializer).  References within the
+function lower via =(data-addr SYM)= (=--static-locals= map), and the
+static decl emits no runtime initializer.
+
+Result: =:non-constant-array-size= 41 → 13, coverage 94.5% → *95.6%*
+(2286 / 2392).  Remaining 13 are genuine VLAs / non-constant dims.  Top
+buckets now: =:unknown-struct= 47 (incomplete-type tail), =:addr-of-non-
+memory-var= 27 (=&param= / =&otherGlobal=).
