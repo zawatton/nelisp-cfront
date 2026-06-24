@@ -177,6 +177,38 @@ int main(void){
     (should (equal "15 14 42" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-scope-shadowed-local-different-types-e2e ()
+  "A local name redeclared with a *different* struct type in sibling
+scopes (here two `switch' cases) resolves to the right type in each —
+the lexical-block-scoping rename gives each declaration its own slot."
+  (unless (nelisp-cfront-scope-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-scope-test--run "
+struct A { int av; int ax; };
+struct B { long bv; long bx; };
+int pick(int mode, struct A *pa, struct B *pb){
+  int r = 0;
+  switch(mode){
+    case 1: { struct A *p = pa; r = p->av + p->ax; break; }
+    case 2: { struct B *p = pb; r = (int)(p->bv + p->bx); break; }
+    default: r = -1;
+  }
+  return r;
+}
+" "
+#include <stdio.h>
+struct A { int av; int ax; };
+struct B { long bv; long bx; };
+extern int pick(int, struct A*, struct B*);
+int main(void){
+  struct A a = {10, 20}; struct B b = {100, 200};
+  printf(\"%d %d %d\\n\", pick(1,&a,&b), pick(2,&a,&b), pick(9,&a,&b));
+  return (pick(1,&a,&b)==30 && pick(2,&a,&b)==300 && pick(9,&a,&b)==-1) ? 0 : 1;
+}
+")))
+    (should (equal "30 300 -1" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-scope-test)
 
 ;;; nelisp-cfront-scope-test.el ends here

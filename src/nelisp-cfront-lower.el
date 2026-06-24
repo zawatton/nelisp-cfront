@@ -1543,13 +1543,110 @@ Lifts guard clauses — `if (c) <returns>; REST...' — into structured
         ((null (cdr forms)) (car forms))
         (t (cons 'seq forms))))
 
+;;; --- lexical block scoping: rename shadowed locals -------------------
+;;
+;; cfront keeps locals in one flat per-function tenv / slot space.  When a
+;; name is *redeclared* in a sibling/nested block with a different type —
+;; e.g. `LookasideSlot *p' in one `switch' case and `HashElem *p' in
+;; another — the flat tenv picks one type and `p->field' mis-resolves.  A
+;; pre-pass renames each declaration of a multiply-declared name (and its
+;; references, resolved by block scope) to a unique name; the flat
+;; machinery is then correct.  Non-shadowed locals are untouched, so a
+;; function with no redeclared name is returned byte-identical.
+
+(defvar nelisp-cfront-lower--rs-counter 0
+  "Counter for unique shadowed-local rename suffixes.")
+
+(defun nelisp-cfront-lower--rs-multi (body)
+  "Return the set of local NAMEs declared more than once in BODY."
+  (let ((counts (make-hash-table :test 'equal)) (multi nil))
+    (cl-labels ((walk (n)
+                  (when (consp n)
+                    (when (eq (car n) 'decl)
+                      (let ((nm (nth 2 n)))
+                        (when nm (puthash nm (1+ (gethash nm counts 0)) counts))))
+                    (dolist (x n) (walk x)))))
+      (walk body))
+    (maphash (lambda (k v) (when (> v 1) (push k multi))) counts)
+    multi))
+
+(defun nelisp-cfront-lower--rs-decl (decl env multi)
+  "Rewrite a `decl' node under ENV; return (NEW-DECL . NEW-ENV).
+The initializer is rewritten with the pre-binding ENV (C scoping); a name
+in MULTI is given a fresh unique slot visible to later siblings."
+  (let* ((ty (nth 1 decl)) (nm (nth 2 decl)) (init (nth 3 decl))
+         (init2 (and init (nelisp-cfront-lower--rs init env multi)))
+         (newnm (if (and nm (member nm multi))
+                    (format "%s__rs%d" nm
+                            (setq nelisp-cfront-lower--rs-counter
+                                  (1+ nelisp-cfront-lower--rs-counter)))
+                  nm)))
+    (cons (list 'decl ty newnm init2)
+          (if nm (cons (cons nm newnm) env) env))))
+
+(defun nelisp-cfront-lower--rs-seq (stmts env multi)
+  "Rewrite a block's STMTS, threading declared bindings to later siblings;
+the extended env does not escape (caller restores ENV)."
+  (let ((e env) (out nil))
+    (dolist (s stmts)
+      (cond
+       ((and (consp s) (eq (car s) 'decl))
+        (let ((r (nelisp-cfront-lower--rs-decl s e multi)))
+          (push (car r) out) (setq e (cdr r))))
+       ((and (consp s) (eq (car s) 'decls))
+        (let ((ds nil) (ee e))
+          (dolist (d (cdr s))
+            (let ((r (nelisp-cfront-lower--rs-decl d ee multi)))
+              (push (car r) ds) (setq ee (cdr r))))
+          (push (cons 'decls (nreverse ds)) out) (setq e ee)))
+       (t (push (nelisp-cfront-lower--rs s e multi) out))))
+    (nreverse out)))
+
+(defun nelisp-cfront-lower--rs (node env multi)
+  "Rewrite NODE, renaming references/decls of MULTI names per block scope.
+ENV maps a C name to its current unique name."
+  (cond
+   ((not (consp node)) node)
+   ((eq (car node) 'var)
+    (let ((u (assoc (nth 1 node) env))) (if u (list 'var (cdr u)) node)))
+   ((eq (car node) 'block)
+    (cons 'block (nelisp-cfront-lower--rs-seq (cdr node) env multi)))
+   ((eq (car node) 'for)
+    ;; (for INIT COND STEP BODY): INIT's binding spans the whole for.
+    (let* ((ir (if (and (consp (nth 1 node)) (eq (car (nth 1 node)) 'decl))
+                   (nelisp-cfront-lower--rs-decl (nth 1 node) env multi)
+                 (cons (nelisp-cfront-lower--rs (nth 1 node) env multi) env)))
+           (e2 (cdr ir)))
+      (list 'for (car ir)
+            (nelisp-cfront-lower--rs (nth 2 node) e2 multi)
+            (nelisp-cfront-lower--rs (nth 3 node) e2 multi)
+            (nelisp-cfront-lower--rs (nth 4 node) e2 multi))))
+   (t (cons (car node)
+            (mapcar (lambda (x) (nelisp-cfront-lower--rs x env multi))
+                    (cdr node))))))
+
+(defun nelisp-cfront-lower--rename-shadowed (body params)
+  "Rename multiply-declared locals in BODY so each declaration scope gets a
+unique name; PARAMS seed the outer scope (never renamed).  Returns BODY
+unchanged when no name is redeclared."
+  (let ((multi (nelisp-cfront-lower--rs-multi body)))
+    (if (null multi)
+        body
+      (let ((nelisp-cfront-lower--rs-counter 0)
+            (env (delq nil (mapcar (lambda (p) (and (nth 2 p)
+                                                    (cons (nth 2 p) (nth 2 p))))
+                                   params))))
+        (nelisp-cfront-lower--rs body env multi)))))
+
 ;;; --- functions / program --------------------------------------------
 
 (defun nelisp-cfront-lower--func (node)
   (let* ((rty (nth 1 node))
          (name (nelisp-cfront-lower--sym (nth 2 node)))
          (params (nth 3 node))
-         (body (nth 4 node))
+         ;; lexical block scoping: rename locals redeclared with different
+         ;; types in sibling scopes so the flat tenv/slot space is correct.
+         (body (nelisp-cfront-lower--rename-shadowed (nth 4 node) params))
          (void-p (and (eq (plist-get rty :base) 'void) (= 0 (plist-get rty :ptr))))
          (nelisp-cfront-lower--ret-float (nelisp-cfront-float-type-p rty))
          (addr-taken (nelisp-cfront-lower--collect-addr-taken body nil))

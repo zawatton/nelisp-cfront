@@ -622,3 +622,26 @@ free replication — the advice itself over-reported) split the 12 cases:
 Result: =:unknown-struct= 5 → 3, coverage 98.0% → *98.1%* (2347 / 2392),
 plus correct =sizeof(struct/array/float)=.  Remaining =:unknown-field= 7 /
 =:unknown-struct= 3 are the block-scoping / anonymous-struct hard tail.
+
+* §17 lexical block scoping (rename shadowed locals) — 98.1% → 98.2%
+
+The `:unknown-field' bucket (7) was *type confusion*: cfront keeps locals
+in one flat per-function tenv, so a name redeclared with a different type
+in sibling scopes (`LookasideSlot *p' vs `HashElem *p' in two `switch'
+cases of `sqlite3_db_status') resolved to one type and `p->field'
+mis-resolved — silently mis-typed even in functions that happened to lower.
+
+Fix (`nelisp-cfront-lower--rename-shadowed', run first in `--func'): a
+pre-pass renames every declaration of a *multiply-declared* name (and its
+references, resolved by walking block scope) to a unique slot; the flat
+tenv/slot space is then correct.  Functions with no redeclared name are
+returned unchanged (zero impact on the ~2300 already-OK functions).
+
+Result: `:unknown-field' 7 → *0* (the type confusion is gone), coverage
+98.1% → 98.2% (2348 / 2392).  The net coverage move is small because most
+of those 7 functions, once correctly typed, hit a *different* remaining
+gap (an anonymous `:unknown-struct nil' or `&' case) — but the latent
+mis-typing is fixed for every shadowing function, not just the failing
+ones.  Remaining tail: `:non-constant-array-size' 12 (VLAs),
+`:unknown-struct' 9 (anonymous tag-nil structs + a function-local
+`Sublist' layout), `:addr-of' 8, `:deref-non-pointer' 7, `:varargs' 7.
