@@ -52,6 +52,16 @@
   "Alist of enum-constant NAME -> integer value, accumulated during a parse.
 `parse-primary' folds a reference to such a NAME into its `(int VALUE)'.")
 
+(defvar nelisp-cfront-parse--last-base-ptr 0
+  "Intrinsic (declarator-independent) pointer level of the type just parsed
+by `parse-type' — i.e. the pointer level carried by the type SPECIFIER
+itself (a pointer typedef like `typedef T *TP'), excluding the syntactic
+`*' stars that bind to one declarator.  In `T a, b;' the syntactic `*'
+binds only to its declarator (`int *a, b' => a is `int*', b is `int'),
+but a pointer typedef's level is shared by every declarator (`TP a, b'
+=> both are `T*').  Comma-declarator loops read this to seed each later
+declarator's pointer count instead of resetting it to 0.")
+
 (defun nelisp-cfront-parse--enum-lookup (name)
   "Return (NAME . VALUE) when NAME is a known enum constant, else nil."
   (assoc name nelisp-cfront-parse--enum-consts))
@@ -241,6 +251,8 @@ the lowerer can lift a function-static local to a module global."
       (let* ((bt (nelisp-cfront-parse--typedef-lookup
                   (nth 1 (nelisp-cfront-parse--advance))))
              (ptr (or (plist-get bt :ptr) 0)))
+        ;; the typedef's own pointer level is shared by all declarators
+        (setq nelisp-cfront-parse--last-base-ptr ptr)
         (while (or (nelisp-cfront-parse--at-punct "*")
                    (and (nelisp-cfront-parse--at 'keyword)
                         (member (nelisp-cfront-parse--pval) '("const" "volatile" "restrict"))))
@@ -286,6 +298,9 @@ the lowerer can lift a function-static local to a module global."
                   (t (signal 'nelisp-cfront-parse-error
                              (list :not-a-type (nelisp-cfront-parse--peek))))))
            (ptr 0))
+      ;; a plain type specifier carries no declarator-independent pointer
+      ;; level; every `*' below binds to the (first) declarator only.
+      (setq nelisp-cfront-parse--last-base-ptr 0)
       (while (or (nelisp-cfront-parse--at-punct "*")
                  (and (nelisp-cfront-parse--at 'keyword)
                       (member (nelisp-cfront-parse--pval) '("const" "volatile" "restrict"))))
@@ -323,6 +338,8 @@ the lowerer can lift a function-static local to a module global."
   (let ((fields nil))
     (while (not (nelisp-cfront-parse--at-punct "}"))
       (let* ((fty (nelisp-cfront-parse--parse-type))
+             ;; pointer level shared by all declarators (a pointer typedef).
+             (field-base-ptr nelisp-cfront-parse--last-base-ptr)
              (fname nil) (bits nil))
         (cond
          ((nelisp-cfront-parse--at-fnptr-declarator)   ; fn-ptr field: ret (*f)(...)
@@ -355,7 +372,7 @@ the lowerer can lift a function-static local to a module global."
         (let ((base (nelisp-cfront-parse--base-type fty)))
           (while (nelisp-cfront-parse--at-punct ",")
             (nelisp-cfront-parse--advance)
-            (let ((ptr 0))
+            (let ((ptr field-base-ptr)) ; seed from the typedef's shared level
               (while (nelisp-cfront-parse--at-punct "*")
                 (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
               (if (nelisp-cfront-parse--at-fnptr-declarator)
@@ -723,6 +740,9 @@ arrays), so this is parse-only for now."
   "Parse a (possibly multi-declarator) local declaration, no trailing `;'.
 Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
   (let* ((ty0 (nelisp-cfront-parse--parse-type))
+         ;; pointer level intrinsic to the type specifier (a pointer typedef),
+         ;; shared by every declarator; captured before any `*' is consumed.
+         (base-ptr nelisp-cfront-parse--last-base-ptr)
          (base (nelisp-cfront-parse--base-type ty0))
          (decls nil) (first t)
          ;; bare type declaration (local struct/union/enum def, no declarator)
@@ -730,7 +750,7 @@ Returns a `(decl TY NAME INIT)' or `(decls DECL...)' for `T a, b;'."
     (while (not done)
       (let ((dty (if first ty0 base)) (name nil) (init nil))
         (unless first
-          (let ((ptr 0))
+          (let ((ptr base-ptr))   ; seed from the typedef's shared pointer level
             (while (nelisp-cfront-parse--at-punct "*")
               (nelisp-cfront-parse--advance) (setq ptr (1+ ptr)))
             (setq dty (plist-put (copy-sequence base) :ptr ptr))))
