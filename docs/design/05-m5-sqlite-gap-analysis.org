@@ -709,3 +709,34 @@ multi-register struct-arg ABI), `:deref' 5 (static FuncDef tables with a
 bitfield/union/anonymous member `--lay' still can't encode),
 `:non-constant-array-size' 3 (`__builtin_offsetof' dim), `:unknown-struct'
 3 (anonymous tag-nil), `excessive-lisp-nesting' 1.
+
+* §21 compile-gap probe: AOT back-end coverage (the stage after lower-gap)
+
+`spike/compile-gap-probe.el` (`make compile-gap FILE=...`) takes each
+lowering-OK `func' and runs its grammar through the REAL AOT back-end
+(`nelisp-aot-compile-to-link-unit' = parse -> two-pass emit -> ELF
+link-unit), bucketing compile failures — the next stage after `lower-gap'.
+
+Result on real `sqlite3.pp.c` (max-lisp-eval-depth raised): 2392 total,
+2368 lowered, *2281 AOT-compiled = 95.4% of total, 96.3% of lowered*.
+
+The only remaining compile-fail bucket is `nelisp-asm-x86_64-error' (87),
+and every one is `(:unresolved-label FN :at-slot N)' — a *per-function
+isolation artifact*: a function referencing another same-unit function (a
+call or a function-pointer `&fn') cannot resolve that label when compiled
+ALONE; in a whole-program object the label is present and resolves.  So
+the back-end has *no real gap* on what cfront lowers — once two
+environment/measurement issues are handled:
+  1. raise `max-lisp-eval-depth' (huge functions like sqlite3PagerOpen
+     overflow the default during the back-end's tree recursion — a config,
+     not a limit; the real compile driver must set it);
+  2. compile the whole program (or batches) so cross-function references
+     resolve (the per-function probe over-reports these as
+     :unresolved-label).
+
+*Next milestone*: whole-program compile — assemble all 2368 lowered
+defuns + the global/string/static data-blobs into one link-unit (skipping
+the 24 un-lowerable funcs) and emit a single `.o', then link + run real
+SQL.  That converts "96% of functions individually compile" into a real
+libsqlite3-subset artifact and surfaces any genuine whole-program issues
+(symbol collisions, .o size, link).
