@@ -1426,14 +1426,14 @@ ignored.  AP must be a plain local/param variable."
       (cons 'call-ptr (cons (nelisp-cfront-lower--expr target) gargs))))))
 
 (defun nelisp-cfront-lower--extern-arg (a)
-  "Lower one extern-call argument A: an int / pointer is a bare GP value.
-NOTE: a `double'/`float' extern argument is not yet supported — cfront
-carries a double as i64 bits and the back-end's f64-call leaf shapes do not
-yet accept a `bits-to-f64' of a computed value, so it is tagged `:f64' and
-will raise `:f64-leaf-shape-unsupported' at compile time (a loud failure
-rather than a silently wrong call).  Integer/pointer args and varargs work."
+  "Lower one extern-call argument A.  An int / pointer is a bare GP value.
+A `double'/`float' argument is carried by cfront as i64 bits; it is tagged
+`(:f64 (bits-to-f64 BITS))' so the back-end reinterprets the bit pattern
+into the xmm argument register via MOVQ (`bits-to-f64' is an accepted f64
+leaf shape).  This covers a double computed by the soft-float helpers, a
+double parameter (its slot holds the bits), and a double literal."
   (if (nelisp-cfront-lower--expr-float-p a)
-      (list :f64 (nelisp-cfront-lower--as-double-bits a))
+      (list :f64 (list 'bits-to-f64 (nelisp-cfront-lower--as-double-bits a)))
     (nelisp-cfront-lower--expr a)))
 
 (defun nelisp-cfront-lower--extern-call (name args)
@@ -1458,7 +1458,10 @@ without it a `printf'-style call faults on a garbage AL."
                         (list (cons :varargs
                                     (mapcar #'nelisp-cfront-lower--extern-arg rest)))))
             (cons head (cons sym (mapcar #'nelisp-cfront-lower--extern-arg args))))))
-    call))
+    ;; A `double'-returning extern leaves its result in xmm0 (SysV f64
+    ;; return); cfront represents a double as i64 bits in a gp slot, so
+    ;; wrap the call in `f64-bits' (MOVQ xmm0 -> rax) to bridge it back.
+    (if ret-f64 (list 'f64-bits call) call)))
 
 (defun nelisp-cfront-lower--incdec (e)
   "Lower ++/-- (pre or post) on ANY lvalue by desugaring to

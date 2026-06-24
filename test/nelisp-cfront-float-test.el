@@ -141,6 +141,63 @@ int main(void){
   (should (= (nelisp-cfront-float--double-to-bits -1.0)
              (- #xbff0000000000000 (ash 1 64)))))
 
+(ert-deftest nelisp-cfront-float-extern-libm-e2e ()
+  "cfront can CALL a standard-ABI extern `double' function (libm).  cfront
+carries a `double' as i64 bits in a gp slot, so a `double' extern argument
+is bridged into the xmm register with `bits-to-f64' (MOVQ) and a `double'
+return is bridged back with `f64-bits' (MOVQ xmm0 -> rax).  Exercises a
+single f64 arg (`sqrt'/`sin'), two f64 args (`pow'), a mixed f64+int call
+(`ldexp'), and an f64 expression feeding an extern arg (`a*a+b*b').  The
+driver bit-casts across cfront's gp-bits `double' ABI (B/U) and links -lm."
+  (skip-unless (nelisp-cfront-float-test--available-p))
+  (let* ((dir (make-temp-file "nlcf-libm" t))
+         (obj (expand-file-name "prog.o" dir))
+         (cdrv (expand-file-name "drv.c" dir))
+         (bin (expand-file-name "prog" dir)))
+    (unwind-protect
+        (progn
+          (nelisp-cfront-compile-string "
+extern double sqrt(double);
+extern double pow(double, double);
+extern double sin(double);
+extern double ldexp(double, int);
+double my_sqrt(double x){ return sqrt(x); }
+double my_pow(double a, double b){ return pow(a, b); }
+double my_hypot(double a, double b){ return sqrt(a*a + b*b); }
+double my_ldexp(double x, int e){ return ldexp(x, e); }
+double my_sin(double x){ return sin(x); }
+" obj)
+          (with-temp-file cdrv (insert "
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+static long B(double d){ long x; memcpy(&x,&d,8); return x; }
+static double U(long x){ double d; memcpy(&d,&x,8); return d; }
+extern long my_sqrt(long), my_pow(long,long), my_hypot(long,long),
+            my_ldexp(long,int), my_sin(long);
+int main(void){
+  double s  = U(my_sqrt(B(2.0)));
+  double p  = U(my_pow(B(2.0), B(10.0)));
+  double h  = U(my_hypot(B(3.0), B(4.0)));
+  double l  = U(my_ldexp(B(2.0), 3));
+  double sn = U(my_sin(B(1.0)));
+  int ok = (fabs(s-sqrt(2.0))<1e-12) && (fabs(p-1024.0)<1e-9)
+        && (fabs(h-5.0)<1e-12) && (fabs(l-16.0)<1e-12)
+        && (fabs(sn-sin(1.0))<1e-12);
+  printf(\"%.6f|%.1f|%.1f|%.1f|%.6f|%s\\n\", s, p, h, l, sn, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+"))
+          (let ((cc (or (executable-find "cc") (executable-find "gcc"))))
+            (unless (zerop (call-process cc nil nil nil cdrv obj "-o" bin "-lm"))
+              (error "libm e2e: link failed"))
+            (with-temp-buffer
+              (let ((rc (call-process bin nil t nil)))
+                (should (= 0 rc))
+                (should (equal "1.414214|1024.0|5.0|16.0|0.841471|OK"
+                               (string-trim (buffer-string))))))))
+      (ignore-errors (delete-directory dir t)))))
+
 (provide 'nelisp-cfront-float-test)
 
 ;;; nelisp-cfront-float-test.el ends here
