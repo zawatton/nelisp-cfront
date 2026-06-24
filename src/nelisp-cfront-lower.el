@@ -766,6 +766,20 @@ descending word widths (u64/u32/u16/u8) at constant offsets."
       (push `(ptr-write-u8 ,d ,off (ptr-read-u8 ,s ,off)) forms) (setq off (+ off 1)))
     `(let ((,d ,dst) (,s ,src)) ,(nelisp-cfront-lower--seq (nreverse forms)))))
 
+(defun nelisp-cfront-lower--zero-bytes (dst off n)
+  "Write N zero bytes at address DST starting at byte offset OFF, in
+descending word widths.  DST is evaluated once into a fresh frame temp."
+  (let ((d (nelisp-cfront-lower--gensym "zd")) (forms nil) (o off) (end (+ off n)))
+    (while (<= (+ o 8) end)
+      (push `(ptr-write-u64 ,d ,o 0) forms) (setq o (+ o 8)))
+    (while (<= (+ o 4) end)
+      (push `(ptr-write-u32 ,d ,o 0) forms) (setq o (+ o 4)))
+    (while (<= (+ o 2) end)
+      (push `(ptr-write-u16 ,d ,o 0) forms) (setq o (+ o 2)))
+    (while (<= (+ o 1) end)
+      (push `(ptr-write-u8 ,d ,o 0) forms) (setq o (+ o 1)))
+    `(let ((,d ,dst)) ,(nelisp-cfront-lower--seq (nreverse forms)))))
+
 (defun nelisp-cfront-lower--elem-size (ptr-expr)
   "Element size of the pointee/array element of PTR-EXPR's type."
   (nelisp-cfront-type-size
@@ -893,7 +907,13 @@ type env separately when they are lifted to globals."
   (when (consp node)
     (pcase (car node)
       ('decl (unless (eq (plist-get (nth 1 node) :storage) 'static)
-               (push (cons (nth 2 node) (nth 1 node)) acc)))
+               ;; resolve an implicit `[]' dimension from the initializer so
+               ;; the type env sees a sized array (`char s[] = "hi"' => char[3]):
+               ;; frame-alloc sizing and `sizeof(s)' both read this type.
+               (push (cons (nth 2 node)
+                           (nelisp-cfront-lower--resolve-array-dim
+                            (nth 1 node) (nth 3 node)))
+                     acc)))
       ('decls (dolist (d (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types d acc))))
       ('block (dolist (s (cdr node)) (setq acc (nelisp-cfront-lower--collect-decl-types s acc))))
       ('if (setq acc (nelisp-cfront-lower--collect-decl-types (nth 2 node) acc))
@@ -1446,6 +1466,26 @@ Only a single top-level forward label (the cleanup pattern) is supported."
               ;; uninitialised, or aggregate init list (local array/struct
               ;; `{...}' init deferred)
               ((or (null init) (and (consp init) (eq (car init) 'init-list))) 0)
+              ;; char array initialized from a string literal: `char s[] = "..."'
+              ;; / `char s[N] = "..."'.  Copy the literal's NUL-terminated
+              ;; rodata image into the frame slot (a mutable copy), NUL-padding
+              ;; the tail when the declared array is longer (C zero-fill) and
+              ;; truncating when shorter.  (A string literal is an array lvalue
+              ;; in rodata, so `--addr' rejects it; this is the array case.)
+              ((and (plist-get ty :array) (consp init) (eq (car init) 'str))
+               (let* ((rty (nelisp-cfront-lower--resolve-array-dim ty init))
+                      (asize (nelisp-cfront-type-size rty nelisp-cfront-lower--structs))
+                      (poolbytes (1+ (length (encode-coding-string
+                                              (nth 1 init) 'utf-8 t))))
+                      (copy-n (min asize poolbytes))
+                      (dst (nelisp-cfront-lower--lvar cname))
+                      (cp (nelisp-cfront-lower--copy-bytes
+                           dst (nelisp-cfront-lower--expr init) copy-n)))
+                 (if (> asize copy-n)
+                     (nelisp-cfront-lower--seq
+                      (list cp (nelisp-cfront-lower--zero-bytes
+                                dst copy-n (- asize copy-n))))
+                   cp)))
               ;; aggregate copy-init: `struct T x = lvalue;' / `T a = b;'
               ;; copies sizeof(ty) bytes from the initializer's address.
               ((nelisp-cfront-lower--aggregate-type-p ty)

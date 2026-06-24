@@ -98,6 +98,32 @@ int main(void){
     (should (equal "[hello, world] [] 12 65 67 1" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-char-array-string-init-e2e ()
+  "A char array initialized from a string literal is a MUTABLE frame copy
+of the literal's bytes (libxml2's `xmlChar ref[] = \"00;\"' idiom).  Covers
+the inferred `[]' size (=> char[len+1], `sizeof' exact), an explicit larger
+size (NUL-padded tail), an explicit smaller size (truncated, no NUL), and
+post-init mutation."
+  (unless (nelisp-cfront-string-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-string-test--run "
+int inferred(void){ char r[] = \"00;\"; r[0]='A'; r[1]='B'; return r[0]+r[1]+r[2]+(int)sizeof(r); }
+int padded(void){ char r[10] = \"abc\"; int i,s=0; for(i=0;i<10;i++) s+=r[i]; return s+(int)sizeof(r); }
+int truncated(void){ char r[2] = \"XYZ\"; return r[0]+r[1]+(int)sizeof(r); }
+int hexref(int c){ char ref[] = \"00;\"; const char *hex = \"0123456789ABCDEF\";
+  ref[0]=hex[c/16%16]; ref[1]=hex[c%16]; return ref[0]*1000 + ref[1]*10 + ref[2]; }
+" "
+#include <stdio.h>
+extern int inferred(void), padded(void), truncated(void), hexref(int);
+int main(void){
+  printf(\"%d %d %d %d\\n\", inferred(), padded(), truncated(), hexref(0xAB));
+  return (inferred()==(65+66+59+4) && padded()==(97+98+99+10)
+          && truncated()==(88+89+2) && hexref(0xAB)==('A'*1000+'B'*10+';')) ? 0 : 1;
+}
+")))
+    (should (equal "194 304 179 65719" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-string-test)
 
 ;;; nelisp-cfront-string-test.el ends here
