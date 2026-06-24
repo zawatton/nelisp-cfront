@@ -683,3 +683,29 @@ Result: `:non-constant-array-size' 5 → 2, coverage 98.5% → *98.6%*
 (2358 / 2392).  The last 2 are an `__builtin_offsetof' array dim.
 Remaining tail (34): `:unknown-struct' 9 (anonymous tag-nil structs +
 Sublist), `:addr-of' 8, `:deref-non-pointer' 7, `:varargs' 7.
+
+* §20 :addr-of/:deref sweep — rename-walker fix + &global init (98.6% → 99.0%)
+
+Two fixes crossed 99%:
+
+1. *block-scoping rename walker bug* (98.6→98.9): the generic walker
+   rebuilt a node as `(cons (car node) (mapcar #'rs (cdr node)))' and never
+   recursed into the *car* — so the *first* element of a plain sub-list (a
+   call's first argument, `f(&sNC, ...)') escaped renaming and then
+   mis-resolved (:unknown-struct/:addr-of).  Map over EVERY element (the
+   tag symbol maps to itself): :unknown-struct 9→3.
+
+2. *&global pointer initializer* (98.9→99.0): `--pointer-init-cell' now
+   relocs `&globalVar' / `&globalArray[CONST]' to the global's data symbol
+   (registered globals only, so they are emitted; indexed form adds
+   index*elemsize).  This lifts the function-static registration tables
+   (`static FuncDef aDateTimeFuncs[] = {{... (void*)&sqlite3Config ...}}'):
+   :deref-non-pointer 8→5.
+
+Result: coverage 98.6% → *99.0%* (2368 / 2392).  The last 24 are deep,
+niche features: `:varargs' 7 (upstream va_arg), `:addr-of' 5 (address of a
+struct-by-VALUE parameter — `void f(Token sName){ ...&sName... }', needs
+multi-register struct-arg ABI), `:deref' 5 (static FuncDef tables with a
+bitfield/union/anonymous member `--lay' still can't encode),
+`:non-constant-array-size' 3 (`__builtin_offsetof' dim), `:unknown-struct'
+3 (anonymous tag-nil), `excessive-lisp-nesting' 1.

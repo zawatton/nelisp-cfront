@@ -134,6 +134,35 @@ int main(void){ struct P p;
     (should (equal "8 25 4" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-structtab-addr-of-global-init-e2e ()
+  "A pointer field initialized with `&global' / `&global[const]' in an
+aggregate (here a function-static struct array) resolves via a `.data'
+reloc to the global's symbol (with addend for the indexed form)."
+  (unless (nelisp-cfront-structtab-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-structtab-test--run "
+static int gv = 42;
+static const unsigned char arr[4] = { 10, 20, 30, 40 };
+struct E { int id; const int *p; const unsigned char *q; };
+int getgv(void){
+  static struct E tbl[] = { {1, &gv, &arr[2]}, {2, 0, 0} };
+  return *(tbl[0].p);
+}
+int getq(void){
+  static struct E tbl2[] = { {9, &gv, &arr[2]} };
+  return *(tbl2[0].q);
+}
+" "
+#include <stdio.h>
+extern int getgv(void), getq(void);
+int main(void){
+  printf(\"%d %d\\n\", getgv(), getq());
+  return (getgv()==42 && getq()==30) ? 0 : 1;
+}
+")))
+    (should (equal "42 30" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-structtab-test)
 
 ;;; nelisp-cfront-structtab-test.el ends here

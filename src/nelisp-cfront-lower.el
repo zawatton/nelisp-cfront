@@ -532,6 +532,27 @@ unsupported (e.g. `&global', a non-constant address — deferred)."
          (eq (car-safe (nth 2 expr)) 'var)
          (assoc (nth 1 (nth 2 expr)) nelisp-cfront-lower--funcs))
     (cons (make-string 8 0) (list 0 (intern (nth 1 (nth 2 expr))) 0)))
+   ;; &globalVar -> abs64 reloc to the global's data symbol (only a
+   ;; *registered* global, so it is guaranteed to be emitted).
+   ((and (consp expr) (eq (car expr) 'unop) (equal (nth 1 expr) "&")
+         (eq (car-safe (nth 2 expr)) 'var)
+         (assoc (nth 1 (nth 2 expr)) nelisp-cfront-lower--globals))
+    (cons (make-string 8 0) (list 0 (intern (nth 1 (nth 2 expr))) 0)))
+   ;; &globalArray[CONST] -> reloc to the global + (index * element size).
+   ((and (consp expr) (eq (car expr) 'unop) (equal (nth 1 expr) "&")
+         (eq (car-safe (nth 2 expr)) 'index)
+         (eq (car-safe (nth 1 (nth 2 expr))) 'var)
+         (assoc (nth 1 (nth 1 (nth 2 expr))) nelisp-cfront-lower--globals)
+         (condition-case nil
+             (progn (nelisp-cfront-parse--const-eval (nth 2 (nth 2 expr))) t)
+           (error nil)))
+    (let* ((g (nth 1 (nth 1 (nth 2 expr))))
+           (idx (nelisp-cfront-parse--const-eval (nth 2 (nth 2 expr))))
+           (esz (nelisp-cfront-type-size
+                 (nelisp-cfront-type-elem
+                  (plist-get (cdr (assoc g nelisp-cfront-lower--globals)) :type))
+                 nelisp-cfront-lower--structs)))
+      (cons (make-string 8 0) (list 0 (intern g) (* idx esz)))))
    (t (condition-case nil
           (cons (nelisp-cfront-lower--pack-int
                  (nelisp-cfront-parse--const-eval expr) 8)
