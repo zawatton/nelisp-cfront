@@ -84,6 +84,32 @@ int main(void){
     (should (equal "30 40 100 5" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-structtab-sizeof-dim-and-sizeof ()
+  "An array field dimensioned by `sizeof(struct T)' is laid out correctly
+(resolved at layout time via the struct table), and `sizeof(TYPE)' returns
+the true size for struct/array/float (not the old flat 8)."
+  (unless (nelisp-cfront-structtab-test--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let ((res (nelisp-cfront-structtab-test--run "
+struct E { int x; int y; };
+struct Box { int tag; struct E es[32 / sizeof(struct E)]; int last; };
+static struct Box b;
+int setget(void){ b.tag=7; b.es[3].x=99; b.last=5; return b.tag + b.es[3].x + b.last; }
+int boxsz(void){ return (int)sizeof(struct Box); }
+int fsz(void){ return (int)sizeof(float); }
+" "
+#include <stdio.h>
+struct E { int x; int y; };
+struct Box { int tag; struct E es[32 / sizeof(struct E)]; int last; };
+extern int setget(void), boxsz(void), fsz(void);
+int main(void){
+  printf(\"%d %d %d\\n\", setget(), boxsz(), fsz());
+  return (setget()==111 && boxsz()==(int)sizeof(struct Box) && fsz()==4) ? 0 : 1;
+}
+")))
+    (should (equal "111 40 4" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-structtab-test)
 
 ;;; nelisp-cfront-structtab-test.el ends here

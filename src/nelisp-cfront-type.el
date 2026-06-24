@@ -53,7 +53,7 @@ the tag up in STRUCTS by name."
      ((and arr (> ptr 0)) 8)            ; array of pointers element handled elsewhere
      (arr (* (nelisp-cfront-type-size
               (nelisp-cfront-type--strip-array ty) structs)
-             (nelisp-cfront-type--const arr)))
+             (nelisp-cfront-type--eval-dim arr structs)))
      ((> ptr 0) 8)
      ((eq (plist-get ty :base) 'struct)
       (plist-get (nelisp-cfront-type--resolve-struct ty structs) :size))
@@ -87,6 +87,39 @@ legacy `(int N)' literal node."
   (cond
    ((integerp expr) expr)
    ((and (consp expr) (eq (car expr) 'int)) (nth 1 expr))
+   (t (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr)))))
+
+(defun nelisp-cfront-type--eval-dim (expr structs)
+  "Evaluate an array-dimension EXPR to an integer using the STRUCTS table.
+Beyond `--const' this resolves dimensions the *parser* could not fold —
+notably `sizeof(struct T)' (which needs the layout table) and arithmetic
+over it, e.g. `(1024-8)/sizeof(struct RowSetEntry)'.  Signals
+`:non-constant-array-size' for a genuinely non-constant dim (a VLA / `t')."
+  (cond
+   ((integerp expr) expr)
+   ((eq expr t) (signal 'nelisp-cfront-type-error (list :non-constant-array-size t)))
+   ((consp expr)
+    (pcase (car expr)
+      ('int (nth 1 expr))
+      ('cast (nelisp-cfront-type--eval-dim (nth 2 expr) structs))
+      ('sizeof (nelisp-cfront-type-size (nth 1 expr) structs))
+      ('sizeof-expr (signal 'nelisp-cfront-type-error
+                            (list :non-constant-array-size expr)))
+      ('unop (let ((v (nelisp-cfront-type--eval-dim (nth 2 expr) structs)))
+               (pcase (nth 1 expr)
+                 ("-" (- v)) ("+" v) ("~" (lognot v)) ("!" (if (= v 0) 1 0))
+                 (_ (signal 'nelisp-cfront-type-error
+                            (list :non-constant-array-size expr))))))
+      ('binop (let ((a (nelisp-cfront-type--eval-dim (nth 2 expr) structs))
+                    (b (nelisp-cfront-type--eval-dim (nth 3 expr) structs)))
+                (pcase (nth 1 expr)
+                  ("+" (+ a b)) ("-" (- a b)) ("*" (* a b))
+                  ("/" (if (= b 0) 0 (/ a b))) ("%" (if (= b 0) 0 (% a b)))
+                  ("<<" (ash a b)) (">>" (ash a (- b)))
+                  ("&" (logand a b)) ("|" (logior a b)) ("^" (logxor a b))
+                  (_ (signal 'nelisp-cfront-type-error
+                             (list :non-constant-array-size expr))))))
+      (_ (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr)))))
    (t (signal 'nelisp-cfront-type-error (list :non-constant-array-size expr)))))
 
 (defun nelisp-cfront-type--round-up (n a) (* (/ (+ n a -1) a) a))
@@ -147,6 +180,16 @@ struct whose layout can't yet be computed is skipped, not fatal."
               (nelisp-cfront-type-error nil)))))))
   structs)
 
+(defun nelisp-cfront-type--scan-body (node structs)
+  "Walk statement/expr tree NODE, registering inline struct/union defs from
+any local `decl' type (a struct defined inside a function body)."
+  (when (consp node)
+    (when (eq (car node) 'decl)
+      (setq structs (nelisp-cfront-type--scan-inline (nth 1 node) structs)))
+    (dolist (x node)
+      (setq structs (nelisp-cfront-type--scan-body x structs))))
+  structs)
+
 (defun nelisp-cfront-type-build-structs (program)
   "Build the struct table from PROGRAM `(program TOP...)'.
 Scans inline `:fields' struct/union definitions wherever they appear —
@@ -171,7 +214,10 @@ declaration (e.g. `static struct T {...} a;' then `struct T b;')."
         ((or 'func 'proto)
          (setq structs (nelisp-cfront-type--scan-inline (nth 1 top) structs))
          (dolist (p (nth 3 top))
-           (setq structs (nelisp-cfront-type--scan-inline (nth 1 p) structs))))
+           (setq structs (nelisp-cfront-type--scan-inline (nth 1 p) structs)))
+         ;; struct/union tags defined inside the function body (local decls)
+         (when (eq (car top) 'func)
+           (setq structs (nelisp-cfront-type--scan-body (nth 4 top) structs))))
         (_ nil)))
     structs))
 

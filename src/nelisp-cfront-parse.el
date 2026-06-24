@@ -97,12 +97,15 @@ Enum-constant references are already folded to `(int N)' by
     (_ (signal 'nelisp-cfront-parse-error (list :non-const-expr e)))))
 
 (defun nelisp-cfront-parse--fold-dim (ast)
-  "Fold an already-parsed array-dimension AST to an integer size, or `t'
-when it is not a foldable compile-time constant (= VLA / sizeof(struct) /
-unknown).  The element type stays usable either way."
+  "Fold an already-parsed array-dimension AST to an integer size.
+When the dimension is not foldable at parse time the *expression* is
+returned (not `t'), so a layout-time evaluator can resolve it once the
+struct table exists — notably `sizeof(struct T)' and arithmetic over it
+\(e.g. `(1024-8)/sizeof(struct RowSetEntry)').  A genuine VLA stays a
+non-evaluable expression and fails later as `:non-constant-array-size'."
   (condition-case nil
       (nelisp-cfront-parse--const-eval ast)
-    (nelisp-cfront-parse-error t)))
+    (nelisp-cfront-parse-error ast)))
 
 (defun nelisp-cfront-parse--parse-enum-body ()
   "Parse an enum `{ NAME [= CONST] , ... }' (point at `{'), registering

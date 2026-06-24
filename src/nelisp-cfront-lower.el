@@ -1157,11 +1157,10 @@ re-read for the update, so an lvalue with a side-effecting subexpression
            ,(nelisp-cfront-lower--seq (list update tmp)))))))
 
 (defun nelisp-cfront-lower--sizeof (ty)
-  (let ((ptr (plist-get ty :ptr)))
-    (if (and ptr (> ptr 0)) 8
-      (pcase (plist-get ty :base)
-        ('char 1) ('short 2) ('int 4) ('long 8) ('void 1)
-        (_ 8)))))
+  "Byte size of TYPE in a `sizeof(TYPE)' expression.  Uses the full type
+sizer (struct layout table, arrays incl. `sizeof'-based dims, float=4) —
+the old hand table returned 8 for struct/float/array."
+  (nelisp-cfront-type-size ty nelisp-cfront-lower--structs))
 
 ;;; --- statements ------------------------------------------------------
 

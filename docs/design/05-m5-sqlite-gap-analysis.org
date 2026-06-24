@@ -595,3 +595,30 @@ Result: =:unknown-struct= 47 → *5*, =:addr-of-non-memory-var= 11 → 6,
 coverage 96.2% → *98.0%* (2345 / 2392).  Remaining 47 are now a small
 mixed tail: =:non-constant-array-size= 13 (VLAs), =:deref-non-pointer= 8,
 =:varargs= 7, =:unknown-field= 7, =:addr-of= 6, =:unknown-struct= 5.
+
+* §16 :unknown-field/:unknown-struct tail (98.0% → 98.1%) + sizeof fixes
+
+Precise diagnosis (advice on `type-struct'/`type-field-ty', then advice-
+free replication — the advice itself over-reported) split the 12 cases:
+
+- =:unknown-struct "RowSetChunk"= (sqlite3RowSetClear, rowSetEntryAlloc):
+  the struct has an array field dimensioned by =sizeof(struct RowSetEntry)=
+  — the parser cannot fold a struct =sizeof= (needs the layout table), so
+  the dim became =t= and the struct's own layout failed.  Fixed: the
+  parser now *retains* the dimension expression (=--fold-dim=), and a
+  layout-time =--eval-dim= resolves =sizeof(struct T)= + arithmetic over it
+  using the struct table.  =build-structs= also scans function-body local
+  decls (=--scan-body=) for inline struct tags.
+- =--sizeof= bug (orthogonal, found here): =sizeof(TYPE)= returned a flat
+  8 for struct/array/float.  Now routed through =type-size= (struct layout,
+  =sizeof'-dim arrays, float=4).
+- =:unknown-field= (=Column.iMem=, =FuncDef.data=, …) and the remaining
+  =:unknown-struct nil= / =Sublist= are *block-scoping* type confusion: a
+  local name redeclared with a different struct-pointer type in sibling
+  scopes (e.g. =LookasideSlot *p= and =HashElem *p= in different =switch=
+  cases of =sqlite3_db_status=) — cfront's flat per-function =tenv= picks
+  one type.  A genuine fix needs lexical block scoping; deferred.
+
+Result: =:unknown-struct= 5 → 3, coverage 98.0% → *98.1%* (2347 / 2392),
+plus correct =sizeof(struct/array/float)=.  Remaining =:unknown-field= 7 /
+=:unknown-struct= 3 are the block-scoping / anonymous-struct hard tail.
