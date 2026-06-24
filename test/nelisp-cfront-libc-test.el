@@ -335,6 +335,44 @@ int main(void){
     (should (equal "11 12 13 14 15 16 17|20|OK" (cdr res)))
     (should (= 0 (car res)))))
 
+(ert-deftest nelisp-cfront-host-env-via-extern-libc-e2e ()
+  "Host-environment functions (clock / RNG / environment) work in
+cfront-compiled C: they are ordinary libc `extern-call's the linker
+resolves, so they return REAL host values — `time(0)' is the real wall
+clock (not a 1970 stub), `getenv' reads the real environment, `rand'
+runs.  (The nelisp ELISP interpreter's own `current-time'/`random'
+builtins are a separate, AOT-unimplemented layer — see
+docs/runtime-limitations.md A; that does not constrain compiled C.)"
+  (unless (nelisp-cfront-e2e--available-p)
+    (ert-skip "nelisp AOT backend or cc unavailable"))
+  (let* ((csrc "
+extern char *getenv(const char *);
+extern long time(long *);
+extern int rand(void);
+extern void srand(unsigned);
+int has_var(const char *k){ return getenv(k) != 0; }
+long clock_is_real(void){ return time(0) > 1000000000; }   /* > year 2001 */
+int rng_runs(unsigned seed){ srand(seed); int r = rand(); return r >= 0; }
+")
+         (drv "
+#include <stdio.h>
+extern int has_var(const char *);
+extern long clock_is_real(void);
+extern int rng_runs(unsigned);
+int main(void){
+  int hp = has_var(\"PATH\");          /* 1 — PATH is set */
+  int hn = has_var(\"__NLCF_NOPE__\"); /* 0 — unset */
+  long c  = clock_is_real();           /* 1 — real wall clock */
+  int rr = rng_runs(12345u);           /* 1 */
+  int ok = (hp==1) && (hn==0) && (c==1) && (rr==1);
+  printf(\"path=%d nope=%d clock=%ld rand=%d %s\\n\", hp, hn, c, rr, ok?\"OK\":\"FAIL\");
+  return ok?0:1;
+}
+")
+         (res (nelisp-cfront-e2e--run csrc drv)))
+    (should (equal "path=1 nope=0 clock=1 rand=1 OK" (cdr res)))
+    (should (= 0 (car res)))))
+
 (provide 'nelisp-cfront-libc-test)
 
 ;;; nelisp-cfront-libc-test.el ends here
