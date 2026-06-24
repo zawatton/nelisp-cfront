@@ -740,3 +740,24 @@ the 24 un-lowerable funcs) and emit a single `.o', then link + run real
 SQL.  That converts "96% of functions individually compile" into a real
 libsqlite3-subset artifact and surfaces any genuine whole-program issues
 (symbol collisions, .o size, link).
+
+* §22 emit-el: C -> nelisp-compliant .el (the core deliverable)
+
+The project's actual goal is *generating a nelisp-compliant `.el' source
+file from a C file* — so any C implementation can be "elisp-ified" (and,
+later, the same front-end shape for Python / JS/TS).  cfront already
+lowered C to nelisp-cc grammar in memory and went straight to `.o';
+`nelisp-cfront-emit-el-*' (`make emit-el FILE=foo.c [OUT=foo.el]') now
+*writes that grammar out* as a `.el' file instead — front-end only, no AOT
+back-end needed.
+
+The file is one top-level `(seq (defun ...) (data-blob ...) ...)' form,
+one child per line, with raw `data-blob' bytes escaped so they survive
+`read'.  Verified (ERT `nelisp-cfront-emit-el-*'): the file `read's back
+to exactly the in-memory grammar (incl. unibyte bytes 0/128/250/255), and
+— read back and fed to `nelisp-aot-compile-to-object' — links with cc and
+runs correctly (getb/getsgn/fib/hello -> "250 -128 200 55 hi!").  So the
+generated `.el' is genuine, natively-compilable nelisp source, not just
+text.
+
+Pipeline now: C -> lex -> parse -> lower -> *emit .el* (or -> AOT -> .o).

@@ -1,4 +1,4 @@
-.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc gap lower-gap compile-gap help
+.PHONY: test compile clean stage0 stage1 stage2 stage3 stage4 cc emit-el gap lower-gap compile-gap help
 
 EMACS ?= emacs
 
@@ -78,6 +78,13 @@ cc:
 	$(EMACS) -Q --batch $(LOADPATH) \
 	  -l nelisp-cfront-cc \
 	  -f nelisp-cfront-cc-batch
+
+# Emit a C file as a nelisp-compliant .el grammar file (no object):
+#   make emit-el FILE=foo.c [OUT=foo.el]
+emit-el:
+	$(EMACS) -Q --batch $(LOADPATH) \
+	  -l nelisp-cfront-cc \
+	  -f nelisp-cfront-emit-el-batch
 
 # Gap probe: report cfront's first parse gap on a preprocessed C file.
 #   gcc -E -P sqlite3.c > /tmp/sqlite3.pp.c ; make gap FILE=/tmp/sqlite3.pp.c
